@@ -29,6 +29,7 @@ struct TaskLatency {
         s64 min;
         int pid;
         ktime_t latest_wakeup;
+        bool valid;
 };
 
 struct TaskLatency *my_task;
@@ -62,13 +63,18 @@ static void sched_switched_handler(void *data, bool preempt, struct task_struct 
         return;
     }
 
-    ktime_t wu = READ_ONCE(t->latest_wakeup);
-    if (wu) {
-        s64 delta_ns = ktime_to_ns(ktime_sub(ktime_get(), wu));
-        update_max(t, delta_ns);
-        update_min(t, delta_ns);
-        /* Optional: avoid double-counting until next wakeup */
-        /* WRITE_ONCE(t->latest_wakeup, 0); */
+    {
+        s64 wu = READ_ONCE(t->latest_wakeup);
+        if (wu != 0)
+        {
+                s64 now = ktime_get_ns();
+                // Consume only if unchanged (so that it can only consume a wake up once)
+                if (cmpxchg(&t->latest_wakeup, wu, 0) == wu) {
+                        s64 delta = now - wu;
+                        update_min(t, delta);
+                        update_max(t, delta);
+                }
+        }
     }
 }
 
