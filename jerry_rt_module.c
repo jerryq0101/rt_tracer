@@ -28,8 +28,7 @@ struct TaskLatency {
         s64 max;
         s64 min;
         int pid;
-        ktime_t latest_wakeup;
-        bool valid;
+        s64 latest_wakeup;
 };
 
 struct TaskLatency *my_task;
@@ -53,8 +52,6 @@ static void update_min(struct TaskLatency *task, s64 latency) {
 
 /*
 Function that would be called whn sched_switched happens
-
-TODO: there are potentially race conditions with this
 */
 static void sched_switched_handler(void *data, bool preempt, struct task_struct *prev, struct task_struct *next, unsigned int prev_state)
 {
@@ -62,33 +59,26 @@ static void sched_switched_handler(void *data, bool preempt, struct task_struct 
     if (!t || next->pid != t->pid) {
         return;
     }
-
     {
-        s64 wu = READ_ONCE(t->latest_wakeup);
-        if (wu != 0)
-        {
+        s64 wu = xchg(&t->latest_wakeup, 0);
+        if (wu != 0) {
                 s64 now = ktime_get_ns();
-                // Consume only if unchanged (so that it can only consume a wake up once)
-                if (cmpxchg(&t->latest_wakeup, wu, 0) == wu) {
-                        s64 delta = now - wu;
-                        update_min(t, delta);
-                        update_max(t, delta);
-                }
+                s64 delta = now - wu;
+                update_min(t, delta);
+                update_max(t, delta);
         }
     }
 }
 
 /*
 Function that would be called when sched_wakeup happens.
-
-TODO: There are potentially race conditions with this.
 */
 static void sched_wakeup_handler(void *data, struct task_struct *p)
 {
         struct TaskLatency *t = READ_ONCE(my_task);
         if (t) {
                 if (p->pid == t->pid) {
-                        WRITE_ONCE(t->latest_wakeup, ktime_get());
+                        WRITE_ONCE(t->latest_wakeup, ktime_get_ns());
                 }
         }
 }
@@ -116,8 +106,7 @@ static int __init rt_module_init(void)
                 return -EINVAL;
         }
 
-        // make sure that we actually allocate space for a task before trying to store statistics on it 
-        // SUSPECT that alloc is not happening in time
+        // Allocate GFP_KERNEL in initialization
         my_task = kzalloc(sizeof(struct TaskLatency), GFP_KERNEL);
         if (!my_task)
                 return -ENOMEM;
@@ -153,6 +142,7 @@ static int __init rt_module_init(void)
         if (tracepoint_probe_register(tp_sched_wakeup, sched_wakeup_handler, NULL)) {
                 pr_err("jerry_rt_module: Failed to register probe for sched_wakeup\n");
                 tracepoint_probe_unregister(tp_sched_switch, sched_switched_handler, NULL);
+                kfree(my_task);
                 return -EINVAL;
         }
         
