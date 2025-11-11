@@ -111,6 +111,8 @@ The most that we can do as programmers is to ensure that there aren't any thread
 
 smp_wmb() in start_recording_pid(pid) does a semi-consistency guarantee. It ensures that before the WRITE to active=true, the other CPUs have seen all the previous setup happen while active = false. Therefore if we see active=true, and then pid's struct must have been setup already. Therefore we won't ever be writing to a unsetup pid struct.
 
+Potentialy smp consistency enforcement applies to other cases I didn't consider yet...
+
 READ_ONCE/WRITE_ONCE is making sure that the compiler doesn't do any funny reordering (e.g. partial word writes or reads). 
 
 Remark that the CPU will do reordering of instructions, but it will ensure that dependencies and hazards get resolved.
