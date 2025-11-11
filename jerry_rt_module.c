@@ -37,9 +37,9 @@ struct task_latency_entry {
         s64 last_wakeup_ns;     // Timestamp of the sched_wake event
 }
 
-static struct tl_entry *pidtab;
+static struct task_latency_entry *pidtab;
 
-static inline struct tl_entry *slot_for(pid_t pid)
+static inline struct task_latency_entry *slot_for(pid_t pid)
 {
         if (pid < 0 || pid >= PIDTAB_SIZE) {
                 return NULL;
@@ -50,7 +50,7 @@ static inline struct tl_entry *slot_for(pid_t pid)
 
 /*
 Helper functions
-TODO: Change this spinlock later
+TODO: change this bs
 */
 static __always_inline void update_minmax(struct task_latency_entry *e, s64 v)
 {
