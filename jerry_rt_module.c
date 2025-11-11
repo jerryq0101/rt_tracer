@@ -35,7 +35,7 @@ struct task_latency_entry {
         s64 max_ns;     // Maximum latency
 
         s64 last_wakeup_ns;     // Timestamp of the sched_wake event
-}
+};
 
 static struct task_latency_entry *pidtab;
 
@@ -54,22 +54,11 @@ TODO: change this to not spin, we showed that we don't race when updating for a 
 */
 static __always_inline void update_minmax(struct task_latency_entry *e, s64 v)
 {
-        s64 old, prev;
-        
-        old = READ_ONCE(e->max_ns);
-        while (v > old) {
-                prev = cmpxchg(&e->max_ns, old, v);
-                if (prev == old) break;
-                old = prev;
+        if (READ_ONCE(e->max_ns) < v) {
+                WRITE_ONCE(e->max_ns, v);
         }
-
-        old = READ_ONCE(e->min_ns);
-        while (v < old) {
-                prev = cmpxchg(&e->min_ns, old, v);
-                if (prev == old) {
-                        break;
-                }
-                old = prev;
+        if (v < READ_ONCE(e->min_ns)) {
+                WRITE_ONCE(e->min_ns, v);
         }
 }
 
@@ -113,7 +102,7 @@ static int start_recording_pid(pid_t pid)
 
 static void stop_recording_pid(pid_t pid)
 {
-        struct task_latency *e = slot_for(pid);
+        struct task_latency_entry *e = slot_for(pid);
         if (!e) {
                 return;
         }
@@ -168,6 +157,7 @@ static void sched_wakeup_handler(void *data, struct task_struct *p)
         }
 
         WRITE_ONCE(e->last_wakeup_ns, ktime_get_ns());
+        // smp_store_release(&e->last_wakeup_ns, ktime_get_ns());
 }
 
 /*
@@ -222,14 +212,8 @@ init: initializes tracepoints and links handler functions to those tracepoints
 */
 static int __init rt_module_init(void)
 {
-        if (target_pid < 0) {
-                pr_err("jerry_rt_module: Set Module param target_pid=<pid\n");
-                return -EINVAL;
-        }
-
         // Allocate GFP_KERNEL in initialization
         pidtab = vzalloc(sizeof(struct task_latency_entry) * PIDTAB_SIZE);
-        
 
         pr_info("jerry_rt_module: looking for tracepoints...\n");
         
@@ -263,7 +247,7 @@ static int __init rt_module_init(void)
         }
 
         // Registering the attribute group
-        rt_kobj = kobj_create_and_add("jerry_rt_module", kernel_kobj);
+        rt_kobj = kobject_create_and_add("jerry_rt_module", kernel_kobj);
         if (!rt_kobj) {
                 return -ENOMEM;
         }
@@ -294,7 +278,7 @@ static void __exit rt_module_exit(void)
                         if (READ_ONCE(curr->active) == true) {
                                 pr_info(
                                         "jerry_rt_module: PID=%d, Name=%s, minLat=%lli, maxLat=%lli", 
-                                        i, READ_ONCE(curr->comm), READ_ONCE(curr->min_ns), READ_ONCE(curr->max_ns)
+                                        i, curr->comm, READ_ONCE(curr->min_ns), READ_ONCE(curr->max_ns)
                                 );
                         }
                 }

@@ -107,7 +107,9 @@ In another core 3 in a later time, the scheduler could be called and if task A i
 
 About cache coherence and consistency. The question of when a core calling sched_switch handler, will it see the updated last_wakeup_ns?
 
-The most that we can do as programmers is to ensure that there aren't any thread level races for a single pid. We can't verify that 
+The most that we can do as programmers is to ensure that there aren't any thread level races for a single pid. We can't verify that if wake on core 1 happens before switch on core 2, that we will for sure see that on core 2, that is the hardware's job to sync. 
+
+smp_wmb() in start_recording_pid(pid) does a semi-consistency guarantee. It ensures that before the WRITE to active=true, the other CPUs have seen all the previous setup happen while active = false. Therefore if we see active=true, and then pid's struct must have been setup already. Therefore we won't ever be writing to a unsetup pid struct.
 
 READ_ONCE/WRITE_ONCE is making sure that the compiler doesn't do any funny reordering (e.g. partial word writes or reads). 
 
