@@ -50,7 +50,7 @@ static inline struct task_latency_entry *slot_for(pid_t pid)
 
 /*
 Helper functions
-TODO: change this bs
+TODO: change this to not spin, we showed that we don't race when updating for a single pid.
 */
 static __always_inline void update_minmax(struct task_latency_entry *e, s64 v)
 {
