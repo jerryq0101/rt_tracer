@@ -25,16 +25,20 @@ static struct tracepoint *tp_sched_wakeup;
 
 
 struct task_latency_entry {
-        u32 gen;        // How many times this pid has been reused
-        bool active;    // Pid being tracked
+        u32 gen;                                // How many times this pid has been reused
+        bool active;                            // Pid being tracked
+        int pid;                                // Current pid
+        char comm[TASK_COMM_LEN];               // Task name
 
-        int pid;        // Current pid
-        char comm[TASK_COMM_LEN];              // Task name
+        s64 min_ns;                             // Minimum latency
+        s64 max_ns;                             // Maximum latency
+        s64 last_wakeup_ns;                     // Timestamp of the sched_wake event
 
-        s64 min_ns;     // Minimum latency
-        s64 max_ns;     // Maximum latency
-
-        s64 last_wakeup_ns;     // Timestamp of the sched_wake event
+        // Response time measurement - voluntary sleep
+        s64 run_start_ns;
+        s64 curr_wu_ns;                         // Wake used by this activation (copied at switch in)
+        s64 resp_min_ns;
+        s64 resp_max_ns;
 };
 
 static struct task_latency_entry *pidtab;
@@ -113,30 +117,55 @@ static void stop_recording_pid(pid_t pid)
 
 /*
 Function that would be called whn sched_switched happens
+
+Task is running 
 */
 static void sched_switched_handler(void *data, bool preempt, struct task_struct *prev, struct task_struct *next, unsigned int prev_state)
 {
         // Track latency statistics for the next task switched into 
         struct task_latency_entry *e = slot_for(next->pid);
+        // Need to now also consider the previous task because it is getting switched out
+        struct task_latency_entry *p = slot_for(prev->pid);
         s64 wu, now;
 
         if (!e) {
                 return;
         }
+
         if (!READ_ONCE(e->active)) {
-                return;
-        }
-        if (READ_ONCE(e->pid) != next->pid) {
+                wu = xchg(&e->last_wakeup_ns, 0);
+                if (wu != 0) {
+                        now = ktime_get_ns();
+                        s64 delta = now - wu;
+                        update_minmax(e, delta);
+
+                        // Write down the last wake up time used 
+                        WRITE_ONCE(e->curr_wu_ns, wu);
+                }
+                // Keep track of the current switch in's start (start running)
+                WRITE_ONCE(e->run_start_ns, now);
                 return;
         }
 
-        wu = xchg(&e->last_wakeup_ns, 0);
-        if (wu == 0) {
-                return;
+        // Check for response time (End running)
+        if (!READ_ONCE(p->active)) {
+                s64 rs = xchg(&p->run_start_ns, 0);
+                s64 now = ktime_get_ns();
+
+                // Is this a voluntary exit?
+                if (prev_state & (TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE | TASK_PARKED | TASK_IDLE | TASK_DEAD)) {
+                        s64 wu = xchg(&e->curr_wu_ns, 0);
+                        if (wu) {
+                                s64 resp = now - wu;
+                                if (resp > e->resp_max_ns) {
+                                        WRITE_ONCE(e->resp_max_ns, resp);
+                                }
+                                if (resp < e->resp_min_ns) {
+                                        WRITE_ONCE(e->resp_min_ns, resp);
+                                }
+                        }
+                }
         }
-        now = ktime_get_ns();
-        s64 delta = now - wu;
-        update_minmax(e, delta);
 }
 
 /*
