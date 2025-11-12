@@ -24,6 +24,11 @@ static struct tracepoint *tp_sched_switch;
 static struct tracepoint *tp_sched_wakeup;
 
 
+enum sleep_cause {
+        SC_NONE = 0,
+        SC_TIMER
+};
+
 struct task_latency_entry {
         u32 gen;                                // How many times this pid has been reused
         bool active;                            // Pid being tracked
@@ -38,6 +43,12 @@ struct task_latency_entry {
         s64 curr_wu_ns;                         // Wake used by this activation (copied at switch in)
         s64 resp_min_ns;
         s64 resp_max_ns;
+
+        // Specific timer sleep tracking 
+        enum sleep_cause scause;
+        s64 timer_enter_ns;
+        s64 resp_timer_min_ns;
+        s64 resp_timer_max_ns;
 };
 
 static struct task_latency_entry *pidtab;
@@ -53,7 +64,6 @@ static inline struct task_latency_entry *slot_for(pid_t pid)
 
 /*
 Helper functions
-TODO: change this to not spin, we showed that we don't race when updating for a single pid.
 */
 static __always_inline void update_minmax(struct task_latency_entry *e, s64 v)
 {
@@ -88,6 +98,10 @@ static int start_recording_pid(pid_t pid)
         WRITE_ONCE(e->curr_wu_ns, 0);
         WRITE_ONCE(e->resp_min_ns, LLONG_MAX);
         WRITE_ONCE(e->resp_max_ns, 0);
+        WRITE_ONCE(e->scause, SC_NONE);
+        WRITE_ONCE(e->timer_enter_ns, 0);
+        WRITE_ONCE(e->resp_timer_min_ns, LLONG_MAX);
+        WRITE_ONCE(e->resp_timer_max_ns, 0);
 
         // Set PID's name
         struct task_struct *p = pid_task(find_vpid(pid), PIDTYPE_PID);
@@ -148,10 +162,16 @@ static void sched_switched_handler(void *data, bool preempt, struct task_struct 
         struct task_latency_entry *p = slot_for(prev->pid);
         // Check for response time (p End running)
         if (READ_ONCE(p->active)) {
-                // Is this a voluntary exit?
-                if (prev_state & (TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE | TASK_PARKED | TASK_IDLE | TASK_DEAD)) {
+                // Indicates a voluntary exit
+                bool voluntary = prev_state & (TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE | TASK_PARKED | TASK_IDLE | TASK_DEAD);
+                
+                if (voluntary) {
                         s64 now = ktime_get_ns();
                         s64 wu = xchg(&p->curr_wu_ns, 0);
+                        enum sleep_cause sc = READ_ONCE(p->scause);
+
+                        // Record the the voluntary sleep
+                        // Record the voluntary sleep (timer based)
                         if (wu) {
                                 s64 resp = now - wu;
                                 if (resp > p->resp_max_ns) {
@@ -160,7 +180,18 @@ static void sched_switched_handler(void *data, bool preempt, struct task_struct 
                                 if (resp < p->resp_min_ns) {
                                         WRITE_ONCE(p->resp_min_ns, resp);
                                 }
+                                if (sc == SC_TIMER) {
+                                        if (resp > READ_ONCE(p->resp_timer_max_ns)) {
+                                                WRITE_ONCE(p->resp_timer_max_ns, resp);
+                                        }
+                                        if (resp < READ_ONCE(p->resp_timer_min_ns)) {
+                                                WRITE_ONCE(p->resp_timer_min_ns, resp);
+                                        }
+                                }
                         }
+                        // Clear this so that a future switch out doesn't use this
+                        WRITE_ONCE(p->scause, SC_NONE);
+                        WRITE_ONCE(p->timer_enter_ns, 0);
                 }
         }
 }
@@ -185,6 +216,31 @@ static void sched_wakeup_handler(void *data, struct task_struct *p)
         WRITE_ONCE(e->last_wakeup_ns, ktime_get_ns());
         // smp_store_release(&e->last_wakeup_ns, ktime_get_ns());
 }
+
+
+/*
+Raw syscalls for timer sleep
+
+TODO: check TP_PROTO for this: either the wrong order or less items
+TODO: register this sys enter handler
+*/
+static void sys_enter_handler(void *data, struct pt_regs *regs, long id)
+{
+        if (id != __NR_nanosleep && id != __NR_clock_nanosleep) {
+                return;
+        }
+        
+        pid_t pid = current->pid;
+        struct task_latency_entry *e = slot_for(pid);
+        if (!e || !READ_ONCE(e->active)) {
+                return;
+        }
+
+        WRITE_ONCE(e->scause, SC_TIMER);
+        WRITE_ONCE(e->timer_enter_ns, ktime_get_ns());
+}
+
+
 
 /*
 Used to find the correct tracepoint that we want to hook onto
