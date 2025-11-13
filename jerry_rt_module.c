@@ -28,12 +28,11 @@ static struct tracepoint *tp_sys_enter;
 enum sleep_cause {
         SC_NONE = 0,
         SC_TIMER,
-        SC_OTHER, // FUTURE: SC_LOCK, SC_IO, etc. But its ok for now.
+        SC_OTHER, // FUTURE: SC_LOCK, SC_IO, etc for other potential state tacking 
 };
 
-
 /*
-TODO: check my space efficiency here. This is a lot more than 2MB 
+TODO: check my space efficiency here.
 */
 struct task_latency_entry {
         u32 gen;                                // How many times this pid has been reused
