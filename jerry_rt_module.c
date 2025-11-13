@@ -11,6 +11,7 @@
 #include <linux/vmalloc.h>
 #include <linux/kobject.h>
 #include <linux/sysfs.h>
+#include <asm/unistd.h>
 
 #define PIDTAB_SIZE 65536
 #define TASK_COMM_LEN 20                // TASK LEN < 20 needed. Otherwise kern panic.
@@ -22,11 +23,13 @@ MODULE_VERSION("1.0");
 
 static struct tracepoint *tp_sched_switch;
 static struct tracepoint *tp_sched_wakeup;
-
+static struct tracepoint *tp_sys_enter;
 
 enum sleep_cause {
         SC_NONE = 0,
-        SC_TIMER
+        SC_TIMER,
+        // SC_LOCK,        // (future) caused by lock contention
+        // SC_IO,          // (future) caused by device I/O wait
 };
 
 struct task_latency_entry {
@@ -158,7 +161,7 @@ static void sched_switched_handler(void *data, bool preempt, struct task_struct 
                         WRITE_ONCE(e->curr_wu_ns, wu);
                 }
         }
-        
+
         struct task_latency_entry *p = slot_for(prev->pid);
         // Check for response time (p End running)
         if (READ_ONCE(p->active)) {
@@ -218,20 +221,38 @@ static void sched_wakeup_handler(void *data, struct task_struct *p)
 }
 
 
-/*
-Raw syscalls for timer sleep
 
-TODO: check TP_PROTO for this: either the wrong order or less items
-TODO: register this sys enter handler
+static __always_inline bool is_timer_sleep_syscall(long id)
+{
+        #ifdef __NR_nanosleep
+                if (id == __NR_nanosleep)
+                        return true;
+        #endif
+        #ifdef __NR_nanosleep_time64
+                if (id == __NR_nanosleep_time64)
+                        return true;
+        #endif
+        #ifdef __NR_clock_nanosleep
+                if (id == __NR_clock_nanosleep)
+                        return true;
+        #endif
+        #ifdef __NR_clock_nanosleep_time64
+                if (id == __NR_clock_nanosleep_time64)
+                        return true;
+        #endif
+                return false;
+}
+
+/*
+Handler for all syscalls. However only checking for if its a sleep syscall here.
+The "sys enter" handler will only handle sleeps
 */
 static void sys_enter_handler(void *data, struct pt_regs *regs, long id)
 {
-        if (id != __NR_nanosleep && id != __NR_clock_nanosleep) {
+        if (!is_timer_sleep_syscall(id)) {
                 return;
         }
-        
-        pid_t pid = current->pid;
-        struct task_latency_entry *e = slot_for(pid);
+        struct task_latency_entry *e = slot_for(current->pid);
         if (!e || !READ_ONCE(e->active)) {
                 return;
         }
@@ -239,7 +260,6 @@ static void sys_enter_handler(void *data, struct pt_regs *regs, long id)
         WRITE_ONCE(e->scause, SC_TIMER);
         WRITE_ONCE(e->timer_enter_ns, ktime_get_ns());
 }
-
 
 
 /*
@@ -251,6 +271,8 @@ static void find_tp(struct tracepoint *tp, void *priv)
                 tp_sched_switch = tp;
         } else if (strcmp(tp->name, "sched_wakeup") == 0) {
                 tp_sched_wakeup = tp;
+        } else if (strcmp(tp->name, "sys_enter") == 0) {
+                tp_sys_enter = tp;
         }
 }
 
@@ -328,6 +350,14 @@ static int __init rt_module_init(void)
                 return -EINVAL;
         }
 
+        if (tracepoint_probe_register(tp_sys_enter, sys_enter_handler, NULL)) {
+                pr_err("jerry_rt_module: Failed to register sys_enter probe\n");
+                tracepoint_probe_unregister(tp_sched_switch, sched_switched_handler, NULL);
+                tracepoint_probe_unregister(tp_sched_wakeup, sched_wakeup_handler, NULL);
+                vfree(pidtab);
+                return -EINVAL;
+        }
+
         // Registering the attribute group
         rt_kobj = kobject_create_and_add("jerry_rt_module", kernel_kobj);
         if (!rt_kobj) {
@@ -349,6 +379,9 @@ static void __exit rt_module_exit(void)
         }
         if (tp_sched_wakeup) {
                 tracepoint_probe_unregister(tp_sched_wakeup, sched_wakeup_handler, NULL);
+        }
+        if (tp_sys_enter) {
+                tracepoint_probe_unregister(tp_sys_enter, sys_enter_handler, NULL);
         }
 
         // Wait so that probe function is not still running on other cores
