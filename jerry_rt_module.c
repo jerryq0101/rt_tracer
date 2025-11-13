@@ -55,7 +55,7 @@ struct task_latency_entry {
         // Defn of response time = time_"relief-ed"_from_its_duty - time_awaken
         enum sleep_cause scause;                // cause of next sleep
         enum sleep_cause last_sleep_cause;      // last sleep cause needed because need to know if we came back from HW or lock, or we had a relief and this is a new cycle
-        s64 sleep_start_ns;                     // When we switched out
+        // s64 sleep_start_ns;                     // When we switched out (potentially useful? for later states?)
         s64 cycle_start_ns;                     // When the control loop iteration started
         bool cycle_active;
 
@@ -111,9 +111,11 @@ static int start_recording_pid(pid_t pid)
         WRITE_ONCE(e->resp_min_ns, LLONG_MAX);
         WRITE_ONCE(e->resp_max_ns, 0);
         WRITE_ONCE(e->scause, SC_NONE);
-        WRITE_ONCE(e->timer_enter_ns, 0);
-        WRITE_ONCE(e->resp_timer_min_ns, LLONG_MAX);
-        WRITE_ONCE(e->resp_timer_max_ns, 0);
+        WRITE_ONCE(e->last_sleep_cause, SC_NONE);
+        WRITE_ONCE(e->cycle_start_ns, 0);
+        WRITE_ONCE(e->cycle_active, false);
+        WRITE_ONCE(e->resp_cycle_max_ns, 0);
+        WRITE_ONCE(e->resp_cycle_min_ns, LLONG_MAX);
 
         // Set PID's name
         struct task_struct *p = pid_task(find_vpid(pid), PIDTYPE_PID);
@@ -184,13 +186,11 @@ static void sched_switched_handler(void *data, bool preempt, struct task_struct 
                                 vol_sleep_cause = SC_OTHER;
                         }
                         WRITE_ONCE(p->last_sleep_cause, vol_sleep_cause);
-                        WRITE_ONCE(p->sleep_start_ns, now);
                         WRITE_ONCE(p->scause, SC_NONE);
 
                         s64 wu = xchg(&p->curr_wu_ns, 0);
 
-                        // Record the the voluntary sleep
-                        // Record the voluntary sleep (timer based)
+                        // Record the the voluntary sleep (any type)
                         if (wu) {
                                 s64 resp = now - wu;
                                 if (resp > p->resp_max_ns) {
@@ -238,8 +238,8 @@ static void sched_wakeup_handler(void *data, struct task_struct *p)
 
         s64 now = ktime_get_ns();
         WRITE_ONCE(e->last_wakeup_ns, now);
-        
 
+        // Validate this assumption later
         if (READ_ONCE(e->last_sleep_cause) == SC_TIMER) {
                 WRITE_ONCE(e->cycle_active, true);
                 WRITE_ONCE(e->cycle_start_ns, now);
@@ -417,11 +417,11 @@ static void __exit rt_module_exit(void)
                         struct task_latency_entry *curr = slot_for(i);
                         if (READ_ONCE(curr->active) == true) {
                                 pr_info(
-                                        "jerry_rt_module: PID=%d, Name=%s, minLat=%lli, maxLat=%lli,\nminResponseTimeVoluntarySleepAllTypes=%lli, maxResponseTimeVoluntarySleepAllTypes=%lli, \nminResponseTimeVoluntarySleepTimerBased=%lli, maxResponseTimeVoluntarySleepTimerBased=%lli", 
+                                        "jerry_rt_module: PID=%d, Name=%s, minLat=%lli, maxLat=%lli,\nminResponseTimeVoluntarySleepAllTypes=%lli, maxResponseTimeVoluntarySleepAllTypes=%lli, \nminResponseTimeVoluntarySleepReliefBased=%lli, maxResponseTimeVoluntarySleepReliefBased=%lli", 
                                         i, curr->comm, READ_ONCE(curr->min_ns), 
                                         READ_ONCE(curr->max_ns), 
                                         READ_ONCE(curr->resp_min_ns), READ_ONCE(curr->resp_max_ns), 
-                                        READ_ONCE(curr->resp_timer_min_ns), READ_ONCE(curr->resp_timer_max_ns)
+                                        READ_ONCE(curr->resp_cycle_min_ns), READ_ONCE(curr->resp_cycle_max_ns)
                                 );
                         }
                 }
