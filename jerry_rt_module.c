@@ -153,27 +153,21 @@ static void sched_switched_handler(void *data, bool preempt, struct task_struct 
 {
         // Track latency statistics for the next task switched into 
         struct task_latency_entry *e = slot_for(next->pid);
-        // Need to now also consider the previous task because it is getting switched out
         s64 wu, now;
         
-        if (!e) {
-                return;
-        }
-        
-        if (READ_ONCE(e->active)) {
+        if (e && READ_ONCE(e->active)) {
                 wu = xchg(&e->last_wakeup_ns, 0);
                 if (wu != 0) {
                         now = ktime_get_ns();
                         s64 delta = now - wu;
                         update_minmax(e, delta);
                         
-                        // Write down the last wake up time used 
+                        // Write down the last wake up time used (this is for response time all types voluntary)
                         WRITE_ONCE(e->curr_wu_ns, wu);
                 }
         }
 
         struct task_latency_entry *p = slot_for(prev->pid);
-        // Check for response time (p ends running)
         if (p && READ_ONCE(p->active)) {
                 // Indicates a voluntary exit
                 bool voluntary = prev_state & (TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE | TASK_PARKED | TASK_IDLE | TASK_DEAD);
@@ -342,6 +336,10 @@ static int __init rt_module_init(void)
 {
         // Allocate GFP_KERNEL in initialization
         pidtab = vzalloc(sizeof(struct task_latency_entry) * PIDTAB_SIZE);
+        if (!pidtab) {
+                pr_err("jerry_rt_module: failed to allocate pidtab\n");
+                return -ENOMEM;
+        }
 
         pr_info("jerry_rt_module: looking for tracepoints...\n");
         
@@ -355,6 +353,11 @@ static int __init rt_module_init(void)
         }
         if (!tp_sched_wakeup) {
                 pr_err("jerry_rt_module: We don't have sched_wakeup. ftrace not loaded?");
+                vfree(pidtab);
+                return -ENOENT;
+        }
+        if (!tp_sys_enter) {
+                pr_err("jerry_rt_module: We don't have sys_enter tracepoint\n");
                 vfree(pidtab);
                 return -ENOENT;
         }
@@ -415,13 +418,20 @@ static void __exit rt_module_exit(void)
                 for (int i = 0; i < PIDTAB_SIZE; i++) {
                         struct task_latency_entry *curr = slot_for(i);
                         if (READ_ONCE(curr->active) == true) {
-                                pr_info(
-                                        "jerry_rt_module: PID=%d, Name=%s, minLat=%lli, maxLat=%lli,\nminResponseTimeVoluntarySleepAllTypes=%lli, maxResponseTimeVoluntarySleepAllTypes=%lli, \nminResponseTimeVoluntarySleepReliefBased=%lli, maxResponseTimeVoluntarySleepReliefBased=%lli", 
-                                        i, curr->comm, READ_ONCE(curr->min_ns), 
-                                        READ_ONCE(curr->max_ns), 
-                                        READ_ONCE(curr->resp_min_ns), READ_ONCE(curr->resp_max_ns), 
-                                        READ_ONCE(curr->resp_cycle_min_ns), READ_ONCE(curr->resp_cycle_max_ns)
-                                );
+                                if (strncmp(curr->comm, "irq/", 4) == 0) {
+                                        pr_info("IRQ %s (PID=%d):\n", curr->comm, i);
+                                        pr_info("  service_time_min/max (wake→first sleep): %lld / %lld ns\n", curr->resp_min_ns, curr->resp_max_ns);
+                                        pr_info("  latency_min/max (wake→first run): %lld / %lld ns\n", curr->min_ns, curr->max_ns);
+                                }
+                                else {
+                                        pr_info(
+                                                "jerry_rt_module: PID=%d, Name=%s, minLat=%lli, maxLat=%lli,\nminResponseTimeVoluntarySleepAllTypes=%lli, maxResponseTimeVoluntarySleepAllTypes=%lli, \nminResponseTimeVoluntarySleepReliefBased=%lli, maxResponseTimeVoluntarySleepReliefBased=%lli", 
+                                                i, curr->comm, READ_ONCE(curr->min_ns), 
+                                                READ_ONCE(curr->max_ns), 
+                                                READ_ONCE(curr->resp_min_ns), READ_ONCE(curr->resp_max_ns), 
+                                                READ_ONCE(curr->resp_cycle_min_ns), READ_ONCE(curr->resp_cycle_max_ns)
+                                        );
+                                }
                         }
                 }
                 vfree(pidtab);
