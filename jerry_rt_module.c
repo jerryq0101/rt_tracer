@@ -14,7 +14,6 @@
 #include <asm/unistd.h>
 
 #define PIDTAB_SIZE 65536
-#define TASK_COMM_LEN 20                // TASK LEN < 20 needed. Otherwise kern panic.
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Jerry Qi");
