@@ -11,6 +11,7 @@
 #include <linux/vmalloc.h>
 #include <linux/kobject.h>
 #include <linux/sysfs.h>
+#include <linux/interrupt.h>
 #include <asm/unistd.h>
 
 #define PIDTAB_SIZE 65536
@@ -23,6 +24,8 @@ MODULE_VERSION("1.0");
 static struct tracepoint *tp_sched_switch;
 static struct tracepoint *tp_sched_wakeup;
 static struct tracepoint *tp_sys_enter;
+static struct tracepoint *tp_irq_thread_start_processing;
+static struct tracepoint *tp_irq_thread_end_processing;
 
 enum sleep_cause {
         SC_NONE = 0,
@@ -59,6 +62,11 @@ struct task_latency_entry {
 
         s64 resp_cycle_max_ns;                  // Max response time
         s64 resp_cycle_min_ns;                  // Min Response time
+
+        // IRQ section
+        s64 last_handler_call_entry;
+        s64 interrupt_handler_max_ns;           // max single interrupt handling iteration in the loop
+        s64 interrupt_handler_min_ns;
 };
 
 static struct task_latency_entry *pidtab;
@@ -87,8 +95,6 @@ static __always_inline void update_minmax(struct task_latency_entry *e, s64 v)
 
 /*
 Adding a pid to be recorded, and removing a pid to be recorded
-
-TODO: PID struct initialization changes for the new FSM stuff
 */
 static int start_recording_pid(pid_t pid)
 {
@@ -114,6 +120,9 @@ static int start_recording_pid(pid_t pid)
         WRITE_ONCE(e->cycle_active, false);
         WRITE_ONCE(e->resp_cycle_max_ns, 0);
         WRITE_ONCE(e->resp_cycle_min_ns, LLONG_MAX);
+        WRITE_ONCE(e->last_handler_call_entry, 0);
+        WRITE_ONCE(e->interrupt_handler_max_ns, 0);
+        WRITE_ONCE(e->interrupt_handler_min_ns, LLONG_MAX);
 
         // Set PID's name
         struct task_struct *p = pid_task(find_vpid(pid), PIDTYPE_PID);
@@ -126,8 +135,7 @@ static int start_recording_pid(pid_t pid)
         // Increment to show that this is not the original PID anymore.
         WRITE_ONCE(e->gen, READ_ONCE(e->gen) + 1);
 
-        smp_wmb();
-        WRITE_ONCE(e->active, true);
+        smp_store_release(&e->active, true);
         return 0;
 }
 
@@ -139,7 +147,8 @@ static void stop_recording_pid(pid_t pid)
                 return;
         }
 
-        WRITE_ONCE(e->active, false);
+        // For visibility when the tracepoint is fired immediately after.
+        smp_store_release(&e->active, false);
 }
 
 
@@ -154,7 +163,7 @@ static void sched_switched_handler(void *data, bool preempt, struct task_struct 
         struct task_latency_entry *e = slot_for(next->pid);
         s64 wu, now;
         
-        if (e && READ_ONCE(e->active)) {
+        if (e && smp_load_acquire(&e->active)) {
                 wu = xchg(&e->last_wakeup_ns, 0);
                 if (wu != 0) {
                         now = ktime_get_ns();
@@ -167,7 +176,7 @@ static void sched_switched_handler(void *data, bool preempt, struct task_struct 
         }
 
         struct task_latency_entry *p = slot_for(prev->pid);
-        if (p && READ_ONCE(p->active)) {
+        if (p && smp_load_acquire(&p->active)) {
                 // Indicates a voluntary exit
                 bool voluntary = prev_state & (TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE | TASK_PARKED | TASK_IDLE | TASK_DEAD);
                 
@@ -194,7 +203,7 @@ static void sched_switched_handler(void *data, bool preempt, struct task_struct 
                         }
 
                         if (vol_sleep_cause == SC_TIMER && READ_ONCE(p->cycle_active)) {
-                                s64 cs = READ_ONCE(p->cycle_start_ns);
+                                s64 cs = xchg(&p->cycle_start_ns, 0);
                                 if (cs) {
                                         s64 cycle = now - cs;
                                         if (cycle > READ_ONCE(p->resp_cycle_max_ns)) {
@@ -205,7 +214,6 @@ static void sched_switched_handler(void *data, bool preempt, struct task_struct 
                                         }
                                 }
                                 WRITE_ONCE(p->cycle_active, false);
-                                WRITE_ONCE(p->cycle_start_ns, 0);
                         }
                 }
         }
@@ -221,7 +229,7 @@ static void sched_wakeup_handler(void *data, struct task_struct *p)
         if (!e) {
                 return;
         }
-        if (READ_ONCE(e->active) == false) {
+        if (smp_load_acquire(&e->active) == false) {
                 return;
         }
         if (READ_ONCE(e->pid) != p->pid) {
@@ -271,13 +279,55 @@ static void sys_enter_handler(void *data, struct pt_regs *regs, long id)
                 return;
         }
         struct task_latency_entry *e = slot_for(current->pid);
-        if (!e || !READ_ONCE(e->active)) {
+        if (!e || smp_load_acquire(&e->active) == false) {
                 return;
         }
 
         WRITE_ONCE(e->scause, SC_TIMER);
 }
 
+
+
+/*
+Handler for IRQ tracepoints.
+*/
+static void irq_handling_fn_entry_handler(void *data, int irq, struct irqaction *action)
+{
+        if (action != NULL) {
+                struct task_struct *irq_thread = action->thread;
+                pid_t pid = irq_thread->pid;
+                struct task_latency_entry *e = slot_for(pid);
+                
+                if (e && smp_load_acquire(&e->active)) {
+                        WRITE_ONCE(e->last_handler_call_entry, ktime_get_ns());
+                }
+        }
+}
+
+static void irq_handler_fn_exit_handler(void *data, int irq, struct irqaction *action)
+{
+        if (action != NULL) {
+                struct task_struct *irq_thread = action->thread;
+                if (irq_thread == 0) {
+                        return;
+                }
+                pid_t pid = irq_thread->pid;
+                struct task_latency_entry *e = slot_for(pid);
+                
+                if (e && smp_load_acquire(&e->active)) {
+                        s64 le = xchg(&e->last_handler_call_entry, 0);
+                        if (le != 0) {
+                                s64 delta = ktime_get_ns() - le;
+                                if (delta < READ_ONCE(e->interrupt_handler_min_ns)) {
+                                        WRITE_ONCE(e->interrupt_handler_min_ns, delta);
+                                }
+                                if (delta > READ_ONCE(e->interrupt_handler_max_ns)) {
+                                        WRITE_ONCE(e->interrupt_handler_max_ns, delta);
+                                }
+                        }
+                }
+        }
+}
 
 /*
 Used to find the correct tracepoint that we want to hook onto
@@ -290,6 +340,10 @@ static void find_tp(struct tracepoint *tp, void *priv)
                 tp_sched_wakeup = tp;
         } else if (strcmp(tp->name, "sys_enter") == 0) {
                 tp_sys_enter = tp;
+        } else if (strcmp(tp->name, "irq_threaded_handler_entry") == 0) {
+                tp_irq_thread_start_processing = tp;
+        } else if (strcmp(tp->name, "irq_threaded_handler_exit") == 0) {
+                tp_irq_thread_end_processing = tp;
         }
 }
 
@@ -310,10 +364,11 @@ static ssize_t del_pid_store(struct kobject *kobj,
                              struct kobj_attribute *attr,
                              const char *buf, size_t count)
 {
-    pid_t pid;
-    if (kstrtoint(buf, 10, &pid) == 0)
-        stop_recording_pid(pid);
-    return count;
+        pid_t pid;
+        if (kstrtoint(buf, 10, &pid) == 0) {
+                stop_recording_pid(pid);
+        }
+        return count;
 }
 
 static struct kobj_attribute add_pid_attr = __ATTR_WO(add_pid);
@@ -360,6 +415,16 @@ static int __init rt_module_init(void)
                 vfree(pidtab);
                 return -ENOENT;
         }
+        if (!tp_irq_thread_start_processing) {
+                pr_err("jerry_rt_module: We don't have tp_irq_thread_start_processing tracepoint\n");
+                vfree(pidtab);
+                return -ENOENT;
+        }
+        if (!tp_irq_thread_end_processing) {
+                pr_err("jerry_rt_module: We don't have tp_irq_thread_end_processing tracepoint\n");
+                vfree(pidtab);
+                return -ENOENT;
+        }
 
         pr_info("jerry_rt_module: Found sched_switch and sched_wakeup trace point");
         pr_info("jerry_rt_module: Registering the probe function for each event");
@@ -380,6 +445,25 @@ static int __init rt_module_init(void)
                 pr_err("jerry_rt_module: Failed to register sys_enter probe\n");
                 tracepoint_probe_unregister(tp_sched_switch, sched_switched_handler, NULL);
                 tracepoint_probe_unregister(tp_sched_wakeup, sched_wakeup_handler, NULL);
+                vfree(pidtab);
+                return -EINVAL;
+        }
+
+        if (tracepoint_probe_register(tp_irq_thread_start_processing, irq_handling_fn_entry_handler, NULL)) {
+                pr_err("jerry_rt_module: Failed to register irq_threaded_handler_entry probe\n");
+                tracepoint_probe_unregister(tp_sched_switch, sched_switched_handler, NULL);
+                tracepoint_probe_unregister(tp_sched_wakeup, sched_wakeup_handler, NULL);
+                tracepoint_probe_unregister(tp_sys_enter, sys_enter_handler, NULL);
+                vfree(pidtab);
+                return -EINVAL;
+        }
+        
+        if (tracepoint_probe_register(tp_irq_thread_end_processing, irq_handler_fn_exit_handler, NULL)) {
+                pr_err("jerry_rt_module: Failed to register irq_threaded_handler_entry probe\n");
+                tracepoint_probe_unregister(tp_sched_switch, sched_switched_handler, NULL);
+                tracepoint_probe_unregister(tp_sched_wakeup, sched_wakeup_handler, NULL);
+                tracepoint_probe_unregister(tp_sys_enter, sys_enter_handler, NULL);
+                tracepoint_probe_unregister(tp_irq_thread_start_processing, irq_handling_fn_entry_handler, NULL);
                 vfree(pidtab);
                 return -EINVAL;
         }
@@ -409,6 +493,12 @@ static void __exit rt_module_exit(void)
         if (tp_sys_enter) {
                 tracepoint_probe_unregister(tp_sys_enter, sys_enter_handler, NULL);
         }
+        if (tp_irq_thread_start_processing) {
+                tracepoint_probe_unregister(tp_irq_thread_start_processing, irq_handling_fn_entry_handler, NULL);
+        }
+        if (tp_irq_thread_end_processing) {
+                tracepoint_probe_unregister(tp_irq_thread_end_processing, irq_handler_fn_exit_handler, NULL);
+        }
 
         // Wait so that probe function is not still running on other cores
         tracepoint_synchronize_unregister();
@@ -416,11 +506,12 @@ static void __exit rt_module_exit(void)
         if (pidtab) {
                 for (int i = 0; i < PIDTAB_SIZE; i++) {
                         struct task_latency_entry *curr = slot_for(i);
-                        if (READ_ONCE(curr->active) == true) {
+                        if (smp_load_acquire(&curr->active) == true) {
                                 if (strncmp(curr->comm, "irq/", 4) == 0) {
                                         pr_info("IRQ %s (PID=%d):\n", curr->comm, i);
-                                        pr_info("  service_time_min/max (wake→first sleep): %lld / %lld ns\n", curr->resp_min_ns, curr->resp_max_ns);
-                                        pr_info("  latency_min/max (wake→first run): %lld / %lld ns\n", curr->min_ns, curr->max_ns);
+                                        pr_info("  service_time_min/max (wake->first sleep): %lld / %lld ns\n", curr->resp_min_ns, curr->resp_max_ns);
+                                        pr_info("  latency_min/max (wake->first run): %lld / %lld ns\n", curr->min_ns, curr->max_ns);
+                                        pr_info("  per interrupt bottom half handling time (single iteration): %lld / %lld ns\n", curr->interrupt_handler_min_ns, curr->interrupt_handler_max_ns);
                                 }
                                 else {
                                         pr_info(

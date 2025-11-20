@@ -22,7 +22,7 @@ sched_running: is precisely the moment before a process is context switched to o
 
 The definition of latency that I am trackin here is sched_running - sched_wakeup.
 - This tracks precisely the decision making of the scheduler and interaction with other tasks. 
-- This would not track factors such as time when hardware sends the interrupt to the 
+- This would not track factors such as time when hardware sends the interrupt to the IRQ line
 
 I use ftrace's tracepoints:
 - they are in pointer form, so I find it using for_each_kernel_tracepoint 
@@ -35,7 +35,7 @@ TLDR:
 1. Registering tracepoints at each sched_wakeup and sched_switch. 
 2. We have a pid table.
 3. If the particular pid wakes up, we record its wakeup time. 
-4. If a particular pid gets switched to we calculate its latency using the last wakeup time.
+4. If a particular pid gets switched to, we calculate its latency using the last wakeup time.
 
 Expectation: a pid wakes up - record, ... scheduler does its thing ..., some scheduler decides to pick the pid and schedule it - record. This pair of data forms the min/max.
 
@@ -43,11 +43,13 @@ Expectation: a pid wakes up - record, ... scheduler does its thing ..., some sch
 Full process: 
 1. Hardware interrupt happens
 2. CPU gets that signal
-3. It schedules an IRQ thread to handle this particular hardware interrupt (max priority). - (IRQ threads are specific to PREEMPT_RT systems)
-4. The IRQ thread  will call a device specific handler. If a process was sleeping and waiting for that task, then the handler would go onto the wait queue, and would mark that process to be ready. (AT THIS POINT, WAKEUP TRACEPOINT FIRES)
+25. Runs Top half of handler
+3. (Runs bottom half of handler) The bottom half of handler (which is a continuous loop that is waiting for the Top half to wake it up to start handling interrupts)
+4. The IRQ thread will call a device specific handler. 
+45. After handling, the the handler would mark processes in the wait queue to be ready. (AT THIS POINT, WAKEUP TRACEPOINT FIRES)
 5. The IRQ Thread would then call the scheduler.
 6. (Same core scheduler) Scheduler would make a decision to schedule a task (PREEMPT_RT: the highest priority one)
-7. Before the scheduler calls context switch to a task, sched_switched fires, and we record that tracepoint.
+7. Before the scheduler calls context switch to a task, sched_switched fires, and we record that tracepoint if it is our task.
 
 ### Recording
 
@@ -202,6 +204,14 @@ Core: a program has to have first called sleep() (to change its state), then rea
 
 Therefore, if we track whether this voluntary has a sleep right before it, we are able to distinguish if this voluntary sleep is a relief sleep or not.
 
+Say if there are other types of (voluntary) sleep that cause the task to sleep before our sleep. We distinguish these by both by using three variables `cycle_active`, `scause`, and `last_sleep_cause`.
+
+`scause` allows us to detect a relief sleep within our response time cycle. After a sleep happens, we will set `scause=SC_TIMER`. Then, upon the immediate next sched_switch, when our task switches out of the CPU, we'd know that our task had been switched out because it is sleeping.
+
+`last_sleep_cause` allows us to track a relief based sleep to wake up correctly. Upon doing a relief sleep, we set `last_sleep_cause=SC_TIMER`. At the post wakeup, we'd know by checking `last_sleep_cause` that the previous sleep was a relief sleep, therefore we can start tracking a new cycle and set `cycle_active=true`. 
+
+`cycle_active` helps when we have detected a timer based sleep, and want to check whether we have captured the wakeup that is paired with this timer based sleep. Otherwise, we could account for an invalid datapoint in our min and max.
+
 ![Mini FSM](./resources/mini_FSM.png)
 
 To implement this FSM, we introduce several new variables in the task latency struct.
@@ -210,7 +220,7 @@ scause - accounts when a sleep call happens (used when sched_switch happens)
 
 last_sleep_cause - say if program did a voluntary sleep, sched_switch'ed out, and there was a wakeup, we need to know whether the previous sleep was part of our cycle or not.
 
-cycle_start_ns - this is the variable we consume at q_2, and we set at q_0
+cycle_start_ns - this is the variable we consume at q_2, and we set at q_0 (when we do detect a voluntary based sleep we consume this).
 
 cycle_active - if our program is between a wakeup and a relief sleep.
 
