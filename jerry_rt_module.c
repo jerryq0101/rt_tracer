@@ -733,6 +733,12 @@ static void __exit rt_module_exit(void)
                                         if (v->latency_violations) {
                                                 pr_info("  LatencyBound=%lld, Violations=%lld", v->latency_bound, v->latency_violations);
                                         }
+                                        if (v->response_violations) {
+                                                pr_info("  ResponseBound=%lld, Violations=%lld", v->latency_bound, v->latency_violations);
+                                        }
+                                        if (v->irq_handling_violations) {
+                                                pr_info("  IRQHandlingBound=%lld, Violations=%lld", v->latency_bound, v->latency_violations);
+                                        }
                                 }
                                 else {
                                         pr_info(
@@ -742,6 +748,20 @@ static void __exit rt_module_exit(void)
                                                 READ_ONCE(curr->resp_min_ns), READ_ONCE(curr->resp_max_ns), 
                                                 READ_ONCE(curr->resp_cycle_min_ns), READ_ONCE(curr->resp_cycle_max_ns)
                                         );
+
+                                        struct task_stat_slo *v = &curr->v;
+                                        if (v->latency_violations) {
+                                                pr_info("  LatencyBound=%lld, Violations=%lld", v->latency_bound, v->latency_violations);
+                                        }
+                                        if (v->response_violations) {
+                                                pr_info("  ResponseBound=%lld, Violations=%lld", v->latency_bound, v->latency_violations);
+                                        }
+                                        if (v->response_relief_violations) {
+                                                pr_info("  ResponseReliefBound=%lld, Violations=%lld", v->latency_bound, v->latency_violations);
+                                        }
+                                        if (v->irq_handling_violations) {
+                                                pr_info("  IRQHandlingBound=%lld, Violations=%lld", v->latency_bound, v->latency_violations);
+                                        }
                                 }
                         }
                 }
