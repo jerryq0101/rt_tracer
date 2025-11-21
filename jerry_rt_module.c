@@ -27,10 +27,37 @@ static struct tracepoint *tp_sys_enter;
 static struct tracepoint *tp_irq_thread_start_processing;
 static struct tracepoint *tp_irq_thread_end_processing;
 
+enum violation_field {
+        LATENCY,
+        RESPONSE,
+        RESPONSE_RELIEF,
+        IRQ_HANDLING
+};
+
+
 enum sleep_cause {
         SC_NONE = 0,
         SC_TIMER,
         SC_OTHER, // FUTURE: SC_LOCK, SC_IO, etc for other potential state tacking 
+};
+
+struct task_stat_slo {
+        // For Latency
+        s64 latency_bound;
+        int latency_violations;
+        // TODO: Could be interesting to have a average violation size.
+        
+        // For Response time voluntary sleep
+        s64 response_bound;
+        int response_violations;
+        
+        // Response time relief sleep
+        s64 response_relief_bound;
+        int response_relief_violations;
+        
+        // IRQ tracepoints
+        s64 irq_handling_bound;
+        int irq_handling_violations;
 };
 
 /*
@@ -41,17 +68,17 @@ struct task_latency_entry {
         bool active;                            // Pid being tracked
         int pid;                                // Current pid
         char comm[TASK_COMM_LEN];               // Task name
-
+        
         s64 min_ns;                             // Minimum latency
         s64 max_ns;                             // Maximum latency
         s64 last_wakeup_ns;                     // Timestamp of the sched_wake event
-
+        
         // Response time measurement - voluntary sleep
         // Def'n = latest sleep (because of any reason) - latest wake up
         s64 curr_wu_ns;                         // Wake used by this activation (copied at switch in)
         s64 resp_min_ns;
         s64 resp_max_ns;
-
+        
         // Specific Response time tracking
         // Defn of response time = time_"relief-ed"_from_its_duty - time_awaken
         enum sleep_cause scause;                // cause of next sleep
@@ -59,15 +86,20 @@ struct task_latency_entry {
         // s64 sleep_start_ns;                     // When we switched out (potentially useful? for later states?)
         s64 cycle_start_ns;                     // When the control loop iteration started
         bool cycle_active;
-
+        
         s64 resp_cycle_max_ns;                  // Max response time
         s64 resp_cycle_min_ns;                  // Min Response time
-
-        // IRQ section
+        
+        // IRQ handler (kernel patch) statistics
         s64 last_handler_call_entry;
         s64 interrupt_handler_max_ns;           // max single interrupt handling iteration in the loop
         s64 interrupt_handler_min_ns;
+        
+        // SLO implementation
+        struct task_stat_slo v;
 };
+
+static void update_violation(enum violation_field field, s64 value, struct task_latency_entry *e);
 
 static struct task_latency_entry *pidtab;
 
@@ -123,6 +155,15 @@ static int start_recording_pid(pid_t pid)
         WRITE_ONCE(e->last_handler_call_entry, 0);
         WRITE_ONCE(e->interrupt_handler_max_ns, 0);
         WRITE_ONCE(e->interrupt_handler_min_ns, LLONG_MAX);
+        // SLO violation
+        WRITE_ONCE(e->v.latency_bound, LLONG_MAX);
+        WRITE_ONCE(e->v.latency_violations, 0);
+        WRITE_ONCE(e->v.response_bound, LLONG_MAX);
+        WRITE_ONCE(e->v.response_violations, 0);
+        WRITE_ONCE(e->v.response_relief_bound, LLONG_MAX);
+        WRITE_ONCE(e->v.response_relief_violations, 0);
+        WRITE_ONCE(e->v.irq_handling_bound, LLONG_MAX);
+        WRITE_ONCE(e->v.irq_handling_violations, 0);
 
         // Set PID's name
         struct task_struct *p = pid_task(find_vpid(pid), PIDTYPE_PID);
@@ -169,8 +210,9 @@ static void sched_switched_handler(void *data, bool preempt, struct task_struct 
                         now = ktime_get_ns();
                         s64 delta = now - wu;
                         update_minmax(e, delta);
+                        update_violation((enum violation_field) LATENCY, delta, e);
                         
-                        // Write down the last wake up time used (this is for response time all types voluntary)
+                        // Write down the last wake up time used (this is for response time)
                         WRITE_ONCE(e->curr_wu_ns, wu);
                 }
         }
@@ -200,6 +242,7 @@ static void sched_switched_handler(void *data, bool preempt, struct task_struct 
                                 if (resp < p->resp_min_ns) {
                                         WRITE_ONCE(p->resp_min_ns, resp);
                                 }
+                                update_violation((enum violation_field) RESPONSE, resp, p);
                         }
 
                         if (vol_sleep_cause == SC_TIMER && READ_ONCE(p->cycle_active)) {
@@ -212,6 +255,7 @@ static void sched_switched_handler(void *data, bool preempt, struct task_struct 
                                         if (cycle < READ_ONCE(p->resp_cycle_min_ns)) {
                                                 WRITE_ONCE(p->resp_cycle_min_ns, cycle);
                                         }
+                                        update_violation((enum violation_field) RESPONSE_RELIEF, cycle, p);
                                 }
                                 WRITE_ONCE(p->cycle_active, false);
                         }
@@ -324,10 +368,51 @@ static void irq_handler_fn_exit_handler(void *data, int irq, struct irqaction *a
                                 if (delta > READ_ONCE(e->interrupt_handler_max_ns)) {
                                         WRITE_ONCE(e->interrupt_handler_max_ns, delta);
                                 }
+                                update_violation((enum violation_field) IRQ_HANDLING, delta, e);
                         }
                 }
         }
 }
+
+
+
+/**
+ * Function to update violation status for a particular field
+ * @field is the specific metric that this value is applicable for
+ * 
+ * 
+ */
+static void update_violation(enum violation_field field, s64 value, struct task_latency_entry *e) {
+        s64 bound;
+        switch (field) {
+                case LATENCY:
+                        /**
+                         * This value update was intended for latency
+                         */
+                        bound = READ_ONCE(e->v.latency_bound);
+                        if (value > bound) {
+                                WRITE_ONCE(e->v.latency_violations, READ_ONCE(e->v.latency_violations) + 1);
+                        }
+                case RESPONSE:
+                        bound = READ_ONCE(e->v.response_bound);
+                        if (value > bound) {
+                                WRITE_ONCE(e->v.response_violations, READ_ONCE(e->v.response_violations) + 1);
+                        }
+                case RESPONSE_RELIEF:
+                        bound = READ_ONCE(e->v.response_relief_bound);
+                        if (value > bound) {
+                                WRITE_ONCE(e->v.response_relief_violations, READ_ONCE(e->v.response_relief_violations) + 1);
+                        }
+                case IRQ_HANDLING:
+                        bound = READ_ONCE(e->v.irq_handling_bound);
+                        if (value > bound) {
+                                WRITE_ONCE(e->v.irq_handling_violations, READ_ONCE(e->v.irq_handling_violations) + 1);
+                        }
+                default:
+                        break;
+        }
+}
+
 
 /*
 Used to find the correct tracepoint that we want to hook onto
