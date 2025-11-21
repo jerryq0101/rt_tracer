@@ -101,6 +101,16 @@ struct task_latency_entry {
 
 static void update_violation(enum violation_field field, s64 value, struct task_latency_entry *e);
 
+#define DEFINE_SLO_SETTER(name, field) \
+static void set_##name(pid_t pid, s64 value) { \
+        struct task_latency_entry *e = slot_for(pid); \
+        if (e) { \
+                struct task_stat_slo *s = &e->v; \
+                WRITE_ONCE(s->field, value); \
+        } \
+}
+
+
 static struct task_latency_entry *pidtab;
 
 static inline struct task_latency_entry *slot_for(pid_t pid)
@@ -456,12 +466,131 @@ static ssize_t del_pid_store(struct kobject *kobj,
         return count;
 }
 
+
+DEFINE_SLO_SETTER(latency_bound, latency_bound);
+DEFINE_SLO_SETTER(response_bound, response_bound);
+DEFINE_SLO_SETTER(response_relief_bound, response_relief_bound);
+DEFINE_SLO_SETTER(irq_handling_bound, irq_handling_bound);
+
+
+/**
+ * Helper function parse for two integers
+ */
+static int parse_two_ints(const char *buf, size_t count,
+                          int *first, int *second)
+{
+        char tmp[64];
+        char *space;
+        int ret;
+        size_t len;
+
+        /* Clamp and copy, add '\0' */
+        len = min(count, sizeof(tmp) - 1);
+        memcpy(tmp, buf, len);
+        tmp[len] = '\0';
+
+        /* Find the space separator */
+        space = strchr(tmp, ' ');
+        if (!space)
+                return -EINVAL;
+
+        *space = '\0';           /* Split into two C strings */
+
+        ret = kstrtoint(tmp, 10, first);
+        if (ret)
+                return ret;
+
+        ret = kstrtoint(space + 1, 10, second);
+        if (ret)
+                return ret;
+
+        return 0;
+}
+
+/**
+ * kobj is just the sysfs object the attr is under
+ * attr is the struct that contains the file name, permissions and pointers to store show functions
+ * buf is the raw buffer of characters userspace wrote into the sysfs file
+ * count is number of bytes written.
+ * 
+ * We expect echo "A B", where pid = A, bound = B 
+ * This function would tell us the particular bound it is for.
+ */
+static ssize_t set_slo_latency_bound_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
+        pid_t pid;
+        int bound;
+
+        parse_two_ints(buf, count, &pid, &bound);
+        set_latency_bound(pid, bound);
+
+        return count;
+}
+
+
+static ssize_t set_slo_response_bound_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
+        pid_t pid;
+        int bound;
+
+        parse_two_ints(buf, count, &pid, &bound);
+        set_response_bound(pid, bound);
+
+        return count;
+}
+
+static ssize_t set_slo_response_relief_bound_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
+        pid_t pid;
+        int bound;
+
+        parse_two_ints(buf, count, &pid, &bound);
+        set_response_relief_bound(pid, bound);
+
+        return count;
+}
+
+static ssize_t set_slo_irq_handling_bound_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
+        pid_t pid;
+        int bound;
+
+        parse_two_ints(buf, count, &pid, &bound);
+        set_irq_handling_bound(pid, bound);
+
+        return count;
+}
+
+
+
+
+// static void set_latency_bound(pid_t pid, s64 bound) {
+//         struct task_latency_entry *e = slot_for(pid);
+//         if (e) {
+//                 struct task_stat_slo *s = &e->v;
+//                 WRITE_ONCE(s->latency_bound, bound);
+//         }
+// }
+
+
+
+
+
+
+
+/**
+ * _ATTR_WO macro expands into something like .attr = something, .store=add_pid_store, .show=add_pid_show. Since we register the attr, when that attr is written to, we'd call the function registered with store
+ */
 static struct kobj_attribute add_pid_attr = __ATTR_WO(add_pid);
 static struct kobj_attribute del_pid_attr = __ATTR_WO(del_pid);
+static struct kobj_attribute set_slo_latency_bound_attr = __ATTR_WO(set_slo_latency_bound);
+static struct kobj_attribute set_slo_response_bound_attr = __ATTR_WO(set_slo_response_bound);
+static struct kobj_attribute set_slo_response_relief_bound_attr = __ATTR_WO(set_slo_response_relief_bound);
+static struct kobj_attribute set_slo_irq_handling_bound_attr = __ATTR_WO(set_slo_irq_handling_bound);
 
 static struct attribute *rt_attrs[] = {
         &add_pid_attr.attr,
         &del_pid_attr.attr,
+        &set_slo_latency_bound_attr.attr,
+        &set_slo_response_bound_attr.attr,
+        &set_slo_response_relief_bound_attr.attr,
+        &set_slo_irq_handling_bound_attr.attr,
         NULL,
 };
 ATTRIBUTE_GROUPS(rt);
