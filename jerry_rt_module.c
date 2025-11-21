@@ -491,8 +491,9 @@ static int parse_two_ints(const char *buf, size_t count,
 
         /* Find the space separator */
         space = strchr(tmp, ' ');
-        if (!space)
+        if (!space) {
                 return -EINVAL;
+        }
 
         *space = '\0';           /* Split into two C strings */
 
@@ -501,8 +502,9 @@ static int parse_two_ints(const char *buf, size_t count,
                 return ret;
 
         ret = kstrtoint(space + 1, 10, second);
-        if (ret)
+        if (ret) {
                 return ret;
+        }
 
         return 0;
 }
@@ -726,6 +728,11 @@ static void __exit rt_module_exit(void)
                                         pr_info("  service_time_min/max (wake->first sleep): %lld / %lld ns\n", curr->resp_min_ns, curr->resp_max_ns);
                                         pr_info("  latency_min/max (wake->first run): %lld / %lld ns\n", curr->min_ns, curr->max_ns);
                                         pr_info("  per interrupt bottom half handling time (single iteration): %lld / %lld ns\n", curr->interrupt_handler_min_ns, curr->interrupt_handler_max_ns);
+
+                                        struct task_stat_slo *v = &curr->v;
+                                        if (v->latency_violations) {
+                                                pr_info("  LatencyBound=%lld, Violations=%lld", v->latency_bound, v->latency_violations);
+                                        }
                                 }
                                 else {
                                         pr_info(
