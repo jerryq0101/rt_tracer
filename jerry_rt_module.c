@@ -24,16 +24,15 @@ MODULE_VERSION("1.0");
 static struct tracepoint *tp_sched_switch;
 static struct tracepoint *tp_sched_wakeup;
 static struct tracepoint *tp_sys_enter;
-static struct tracepoint *tp_irq_thread_start_processing;
-static struct tracepoint *tp_irq_thread_end_processing;
+static struct tracepoint *tp_irq_threaded_handler_entry;
+static struct tracepoint *tp_irq_threaded_handler_exit;
 
-enum violation_field {
+enum stat_field {
         LATENCY,
         RESPONSE,
         RESPONSE_RELIEF,
         IRQ_HANDLING
 };
-
 
 enum sleep_cause {
         SC_NONE = 0,
@@ -45,7 +44,6 @@ struct task_stat_slo {
         // For Latency
         s64 latency_bound;
         int latency_violations;
-        // TODO: Could be interesting to have a average violation size.
         
         // For Response time voluntary sleep
         s64 response_bound;
@@ -60,46 +58,42 @@ struct task_stat_slo {
         int irq_handling_violations;
 };
 
-/*
-TODO: check my space efficiency here.
-*/
 struct task_latency_entry {
         u32 gen;                                // How many times this pid has been reused
         bool active;                            // Pid being tracked
         int pid;                                // Current pid
         char comm[TASK_COMM_LEN];               // Task name
         
-        s64 min_ns;                             // Minimum latency
-        s64 max_ns;                             // Maximum latency
-        s64 last_wakeup_ns;                     // Timestamp of the sched_wake event
+        s64 latency_min_ns;                             // Minimum latency
+        s64 latency_max_ns;                             // Maximum latency
+        s64 latency_last_wakeup_ns;                     // Timestamp of the sched_wake event
         
         // Response time measurement - voluntary sleep
         // Def'n = latest sleep (because of any reason) - latest wake up
         s64 curr_wu_ns;                         // Wake used by this activation (copied at switch in)
-        s64 resp_min_ns;
-        s64 resp_max_ns;
+        s64 rt_voluntary_min_ns;
+        s64 rt_voluntary_max_ns;
         
         // Specific Response time tracking
         // Defn of response time = time_"relief-ed"_from_its_duty - time_awaken
         enum sleep_cause scause;                // cause of next sleep
         enum sleep_cause last_sleep_cause;      // last sleep cause needed because need to know if we came back from HW or lock, or we had a relief and this is a new cycle
-        // s64 sleep_start_ns;                     // When we switched out (potentially useful? for later states?)
         s64 cycle_start_ns;                     // When the control loop iteration started
         bool cycle_active;
         
-        s64 resp_cycle_max_ns;                  // Max response time
-        s64 resp_cycle_min_ns;                  // Min Response time
+        s64 rt_relief_max_ns;                  // Max response time
+        s64 rt_relief_min_ns;                  // Min Response time
         
         // IRQ handler (kernel patch) statistics
         s64 last_handler_call_entry;
-        s64 interrupt_handler_max_ns;           // max single interrupt handling iteration in the loop
-        s64 interrupt_handler_min_ns;
+        s64 irq_handle_max_ns;           // max single interrupt handling iteration in the loop
+        s64 irq_handle_min_ns;
         
         // SLO implementation
         struct task_stat_slo v;
 };
 
-static void update_violation(enum violation_field field, s64 value, struct task_latency_entry *e);
+static void update_violation(enum stat_field field, s64 value, struct task_latency_entry *e);
 
 #define DEFINE_SLO_SETTER(name, field) \
 static void set_##name(pid_t pid, s64 value) { \
@@ -125,15 +119,51 @@ static inline struct task_latency_entry *slot_for(pid_t pid)
 /*
 Helper functions
 */
-static __always_inline void update_minmax(struct task_latency_entry *e, s64 v)
+// static __always_inline void update_minmax(struct task_latency_entry *e, s64 v)
+// {
+//         if (READ_ONCE(e->latency_max_ns) < v) {
+//                 WRITE_ONCE(e->latency_max_ns, v);
+//         }
+//         if (v < READ_ONCE(e->latency_min_ns)) {
+//                 WRITE_ONCE(e->latency_min_ns, v);
+//         }
+// }
+
+#define UPDATE_MINMAX_FIELD(e, v, min_field, max_field)         \
+        do {                                                    \
+                s64 __cur_max = READ_ONCE((e)->max_field);      \
+                s64 __cur_min = READ_ONCE((e)->min_field);      \
+                if ((v) > __cur_max)                            \
+                        WRITE_ONCE((e)->max_field, (v));        \
+                if ((v) < __cur_min)                            \
+                        WRITE_ONCE((e)->min_field, (v));        \
+        } while (0)
+
+
+static __always_inline void update_minmax(enum stat_field choice,
+                                          struct task_latency_entry *e,
+                                          s64 v)
 {
-        if (READ_ONCE(e->max_ns) < v) {
-                WRITE_ONCE(e->max_ns, v);
-        }
-        if (v < READ_ONCE(e->min_ns)) {
-                WRITE_ONCE(e->min_ns, v);
+        switch (choice) {
+        case LATENCY:
+                UPDATE_MINMAX_FIELD(e, v, latency_min_ns, latency_max_ns);
+                break;
+        case RESPONSE:
+                UPDATE_MINMAX_FIELD(e, v, rt_voluntary_min_ns, rt_voluntary_max_ns);
+                break;
+        case RESPONSE_RELIEF:
+                UPDATE_MINMAX_FIELD(e, v, rt_relief_min_ns, rt_relief_max_ns);
+                break;
+        case IRQ_HANDLING:
+                UPDATE_MINMAX_FIELD(e, v, irq_handle_min_ns, irq_handle_max_ns);
+                break;
+        default:
+                /* nothing */
+                break;
         }
 }
+
+
 
 /*
 Adding a pid to be recorded, and removing a pid to be recorded
@@ -150,21 +180,21 @@ static int start_recording_pid(pid_t pid)
 
         // Reinit stats
         WRITE_ONCE(e->pid, pid);
-        WRITE_ONCE(e->min_ns, LLONG_MAX);
-        WRITE_ONCE(e->max_ns, 0);
-        WRITE_ONCE(e->last_wakeup_ns, 0);
+        WRITE_ONCE(e->latency_min_ns, LLONG_MAX);
+        WRITE_ONCE(e->latency_max_ns, 0);
+        WRITE_ONCE(e->latency_last_wakeup_ns, 0);
         WRITE_ONCE(e->curr_wu_ns, 0);
-        WRITE_ONCE(e->resp_min_ns, LLONG_MAX);
-        WRITE_ONCE(e->resp_max_ns, 0);
+        WRITE_ONCE(e->rt_voluntary_min_ns, LLONG_MAX);
+        WRITE_ONCE(e->rt_voluntary_max_ns, 0);
         WRITE_ONCE(e->scause, SC_NONE);
         WRITE_ONCE(e->last_sleep_cause, SC_NONE);
         WRITE_ONCE(e->cycle_start_ns, 0);
         WRITE_ONCE(e->cycle_active, false);
-        WRITE_ONCE(e->resp_cycle_max_ns, 0);
-        WRITE_ONCE(e->resp_cycle_min_ns, LLONG_MAX);
+        WRITE_ONCE(e->rt_relief_max_ns, 0);
+        WRITE_ONCE(e->rt_relief_min_ns, LLONG_MAX);
         WRITE_ONCE(e->last_handler_call_entry, 0);
-        WRITE_ONCE(e->interrupt_handler_max_ns, 0);
-        WRITE_ONCE(e->interrupt_handler_min_ns, LLONG_MAX);
+        WRITE_ONCE(e->irq_handle_max_ns, 0);
+        WRITE_ONCE(e->irq_handle_min_ns, LLONG_MAX);
         // SLO violation
         WRITE_ONCE(e->v.latency_bound, LLONG_MAX);
         WRITE_ONCE(e->v.latency_violations, 0);
@@ -208,19 +238,19 @@ Function that would be called whn sched_switched happens
 
 Task is running 
 */
-static void sched_switched_handler(void *data, bool preempt, struct task_struct *prev, struct task_struct *next, unsigned int prev_state)
+static void probe_sched_switch(void *data, bool preempt, struct task_struct *prev, struct task_struct *next, unsigned int prev_state)
 {
         // Track latency statistics for the next task switched into 
         struct task_latency_entry *e = slot_for(next->pid);
         s64 wu, now;
         
         if (e && smp_load_acquire(&e->active)) {
-                wu = xchg(&e->last_wakeup_ns, 0);
+                wu = xchg(&e->latency_last_wakeup_ns, 0);
                 if (wu != 0) {
                         now = ktime_get_ns();
                         s64 delta = now - wu;
-                        update_minmax(e, delta);
-                        update_violation((enum violation_field) LATENCY, delta, e);
+                        update_minmax((enum stat_field) LATENCY, e, delta);
+                        update_violation((enum stat_field) LATENCY, delta, e);
                         
                         // Write down the last wake up time used (this is for response time)
                         WRITE_ONCE(e->curr_wu_ns, wu);
@@ -246,26 +276,16 @@ static void sched_switched_handler(void *data, bool preempt, struct task_struct 
                         // Record the the voluntary sleep (any type)
                         if (wu) {
                                 s64 resp = now - wu;
-                                if (resp > p->resp_max_ns) {
-                                        WRITE_ONCE(p->resp_max_ns, resp);
-                                }
-                                if (resp < p->resp_min_ns) {
-                                        WRITE_ONCE(p->resp_min_ns, resp);
-                                }
-                                update_violation((enum violation_field) RESPONSE, resp, p);
+                                update_minmax((enum stat_field) RESPONSE, p, resp);
+                                update_violation((enum stat_field) RESPONSE, resp, p);
                         }
 
                         if (vol_sleep_cause == SC_TIMER && READ_ONCE(p->cycle_active)) {
                                 s64 cs = xchg(&p->cycle_start_ns, 0);
                                 if (cs) {
                                         s64 cycle = now - cs;
-                                        if (cycle > READ_ONCE(p->resp_cycle_max_ns)) {
-                                                WRITE_ONCE(p->resp_cycle_max_ns, cycle);
-                                        }
-                                        if (cycle < READ_ONCE(p->resp_cycle_min_ns)) {
-                                                WRITE_ONCE(p->resp_cycle_min_ns, cycle);
-                                        }
-                                        update_violation((enum violation_field) RESPONSE_RELIEF, cycle, p);
+                                        update_minmax((enum stat_field) RESPONSE_RELIEF, p, cycle);
+                                        update_violation((enum stat_field) RESPONSE_RELIEF, cycle, p);
                                 }
                                 WRITE_ONCE(p->cycle_active, false);
                         }
@@ -276,7 +296,7 @@ static void sched_switched_handler(void *data, bool preempt, struct task_struct 
 /*
 Function that would be called when sched_wakeup happens.
 */
-static void sched_wakeup_handler(void *data, struct task_struct *p)
+static void probe_sched_wakeup(void *data, struct task_struct *p)
 {
         struct task_latency_entry *e = slot_for(p->pid);
         // set the specific number for last latency
@@ -291,7 +311,7 @@ static void sched_wakeup_handler(void *data, struct task_struct *p)
         }
 
         s64 now = ktime_get_ns();
-        WRITE_ONCE(e->last_wakeup_ns, now);
+        WRITE_ONCE(e->latency_last_wakeup_ns, now);
 
         // Validate this assumption later
         if (READ_ONCE(e->last_sleep_cause) == SC_TIMER) {
@@ -327,7 +347,7 @@ static __always_inline bool is_timer_sleep_syscall(long id)
 Handler for all syscalls. However only checking for if its a sleep syscall here.
 The "sys enter" handler will only handle sleeps
 */
-static void sys_enter_handler(void *data, struct pt_regs *regs, long id)
+static void probe_sys_enter(void *data, struct pt_regs *regs, long id)
 {
         if (!is_timer_sleep_syscall(id)) {
                 return;
@@ -345,7 +365,7 @@ static void sys_enter_handler(void *data, struct pt_regs *regs, long id)
 /*
 Handler for IRQ tracepoints.
 */
-static void irq_handling_fn_entry_handler(void *data, int irq, struct irqaction *action)
+static void probe_irq_threaded_handler_entry(void *data, int irq, struct irqaction *action)
 {
         if (action != NULL) {
                 struct task_struct *irq_thread = action->thread;
@@ -358,7 +378,7 @@ static void irq_handling_fn_entry_handler(void *data, int irq, struct irqaction 
         }
 }
 
-static void irq_handler_fn_exit_handler(void *data, int irq, struct irqaction *action)
+static void probe_irq_threaded_handler_exit(void *data, int irq, struct irqaction *action)
 {
         if (action != NULL) {
                 struct task_struct *irq_thread = action->thread;
@@ -372,13 +392,8 @@ static void irq_handler_fn_exit_handler(void *data, int irq, struct irqaction *a
                         s64 le = xchg(&e->last_handler_call_entry, 0);
                         if (le != 0) {
                                 s64 delta = ktime_get_ns() - le;
-                                if (delta < READ_ONCE(e->interrupt_handler_min_ns)) {
-                                        WRITE_ONCE(e->interrupt_handler_min_ns, delta);
-                                }
-                                if (delta > READ_ONCE(e->interrupt_handler_max_ns)) {
-                                        WRITE_ONCE(e->interrupt_handler_max_ns, delta);
-                                }
-                                update_violation((enum violation_field) IRQ_HANDLING, delta, e);
+                                update_minmax((enum stat_field) IRQ_HANDLING, e, delta);
+                                update_violation((enum stat_field) IRQ_HANDLING, delta, e);
                         }
                 }
         }
@@ -392,7 +407,7 @@ static void irq_handler_fn_exit_handler(void *data, int irq, struct irqaction *a
  * 
  * 
  */
-static void update_violation(enum violation_field field, s64 value, struct task_latency_entry *e) {
+static void update_violation(enum stat_field field, s64 value, struct task_latency_entry *e) {
         s64 bound;
         switch (field) {
                 case LATENCY:
@@ -436,9 +451,9 @@ static void find_tp(struct tracepoint *tp, void *priv)
         } else if (strcmp(tp->name, "sys_enter") == 0) {
                 tp_sys_enter = tp;
         } else if (strcmp(tp->name, "irq_threaded_handler_entry") == 0) {
-                tp_irq_thread_start_processing = tp;
+                tp_irq_threaded_handler_entry = tp;
         } else if (strcmp(tp->name, "irq_threaded_handler_exit") == 0) {
-                tp_irq_thread_end_processing = tp;
+                tp_irq_threaded_handler_exit = tp;
         }
 }
 
@@ -528,7 +543,6 @@ static ssize_t set_slo_latency_bound_store(struct kobject *kobj, struct kobj_att
         return count;
 }
 
-
 static ssize_t set_slo_response_bound_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
         pid_t pid;
         int bound;
@@ -558,21 +572,6 @@ static ssize_t set_slo_irq_handling_bound_store(struct kobject *kobj, struct kob
 
         return count;
 }
-
-
-
-
-// static void set_latency_bound(pid_t pid, s64 bound) {
-//         struct task_latency_entry *e = slot_for(pid);
-//         if (e) {
-//                 struct task_stat_slo *s = &e->v;
-//                 WRITE_ONCE(s->latency_bound, bound);
-//         }
-// }
-
-
-
-
 
 
 
@@ -631,13 +630,13 @@ static int __init rt_module_init(void)
                 vfree(pidtab);
                 return -ENOENT;
         }
-        if (!tp_irq_thread_start_processing) {
-                pr_err("jerry_rt_module: We don't have tp_irq_thread_start_processing tracepoint\n");
+        if (!tp_irq_threaded_handler_entry) {
+                pr_err("jerry_rt_module: We don't have tp_irq_threaded_handler_entry tracepoint\n");
                 vfree(pidtab);
                 return -ENOENT;
         }
-        if (!tp_irq_thread_end_processing) {
-                pr_err("jerry_rt_module: We don't have tp_irq_thread_end_processing tracepoint\n");
+        if (!tp_irq_threaded_handler_exit) {
+                pr_err("jerry_rt_module: We don't have tp_irq_threaded_handler_exit tracepoint\n");
                 vfree(pidtab);
                 return -ENOENT;
         }
@@ -645,41 +644,41 @@ static int __init rt_module_init(void)
         pr_info("jerry_rt_module: Found sched_switch and sched_wakeup trace point");
         pr_info("jerry_rt_module: Registering the probe function for each event");
 
-        if (tracepoint_probe_register(tp_sched_switch, sched_switched_handler, NULL)) {
+        if (tracepoint_probe_register(tp_sched_switch, probe_sched_switch, NULL)) {
                 pr_err("jerry_rt_module: Failed to register probe\n");
                 return -EINVAL;
         }
 
-        if (tracepoint_probe_register(tp_sched_wakeup, sched_wakeup_handler, NULL)) {
+        if (tracepoint_probe_register(tp_sched_wakeup, probe_sched_wakeup, NULL)) {
                 pr_err("jerry_rt_module: Failed to register probe for sched_wakeup\n");
-                tracepoint_probe_unregister(tp_sched_switch, sched_switched_handler, NULL);
+                tracepoint_probe_unregister(tp_sched_switch, probe_sched_switch, NULL);
                 vfree(pidtab);
                 return -EINVAL;
         }
 
-        if (tracepoint_probe_register(tp_sys_enter, sys_enter_handler, NULL)) {
+        if (tracepoint_probe_register(tp_sys_enter, probe_sys_enter, NULL)) {
                 pr_err("jerry_rt_module: Failed to register sys_enter probe\n");
-                tracepoint_probe_unregister(tp_sched_switch, sched_switched_handler, NULL);
-                tracepoint_probe_unregister(tp_sched_wakeup, sched_wakeup_handler, NULL);
+                tracepoint_probe_unregister(tp_sched_switch, probe_sched_switch, NULL);
+                tracepoint_probe_unregister(tp_sched_wakeup, probe_sched_wakeup, NULL);
                 vfree(pidtab);
                 return -EINVAL;
         }
 
-        if (tracepoint_probe_register(tp_irq_thread_start_processing, irq_handling_fn_entry_handler, NULL)) {
+        if (tracepoint_probe_register(tp_irq_threaded_handler_entry, probe_irq_threaded_handler_entry, NULL)) {
                 pr_err("jerry_rt_module: Failed to register irq_threaded_handler_entry probe\n");
-                tracepoint_probe_unregister(tp_sched_switch, sched_switched_handler, NULL);
-                tracepoint_probe_unregister(tp_sched_wakeup, sched_wakeup_handler, NULL);
-                tracepoint_probe_unregister(tp_sys_enter, sys_enter_handler, NULL);
+                tracepoint_probe_unregister(tp_sched_switch, probe_sched_switch, NULL);
+                tracepoint_probe_unregister(tp_sched_wakeup, probe_sched_wakeup, NULL);
+                tracepoint_probe_unregister(tp_sys_enter, probe_sys_enter, NULL);
                 vfree(pidtab);
                 return -EINVAL;
         }
         
-        if (tracepoint_probe_register(tp_irq_thread_end_processing, irq_handler_fn_exit_handler, NULL)) {
+        if (tracepoint_probe_register(tp_irq_threaded_handler_exit, probe_irq_threaded_handler_exit, NULL)) {
                 pr_err("jerry_rt_module: Failed to register irq_threaded_handler_entry probe\n");
-                tracepoint_probe_unregister(tp_sched_switch, sched_switched_handler, NULL);
-                tracepoint_probe_unregister(tp_sched_wakeup, sched_wakeup_handler, NULL);
-                tracepoint_probe_unregister(tp_sys_enter, sys_enter_handler, NULL);
-                tracepoint_probe_unregister(tp_irq_thread_start_processing, irq_handling_fn_entry_handler, NULL);
+                tracepoint_probe_unregister(tp_sched_switch, probe_sched_switch, NULL);
+                tracepoint_probe_unregister(tp_sched_wakeup, probe_sched_wakeup, NULL);
+                tracepoint_probe_unregister(tp_sys_enter, probe_sys_enter, NULL);
+                tracepoint_probe_unregister(tp_irq_threaded_handler_entry, probe_irq_threaded_handler_entry, NULL);
                 vfree(pidtab);
                 return -EINVAL;
         }
@@ -701,19 +700,19 @@ static void __exit rt_module_exit(void)
         // Unregister the schedule 
         if (tp_sched_switch) {
                 // tell the thing to stop calling our function
-                tracepoint_probe_unregister(tp_sched_switch, sched_switched_handler, NULL);
+                tracepoint_probe_unregister(tp_sched_switch, probe_sched_switch, NULL);
         }
         if (tp_sched_wakeup) {
-                tracepoint_probe_unregister(tp_sched_wakeup, sched_wakeup_handler, NULL);
+                tracepoint_probe_unregister(tp_sched_wakeup, probe_sched_wakeup, NULL);
         }
         if (tp_sys_enter) {
-                tracepoint_probe_unregister(tp_sys_enter, sys_enter_handler, NULL);
+                tracepoint_probe_unregister(tp_sys_enter, probe_sys_enter, NULL);
         }
-        if (tp_irq_thread_start_processing) {
-                tracepoint_probe_unregister(tp_irq_thread_start_processing, irq_handling_fn_entry_handler, NULL);
+        if (tp_irq_threaded_handler_entry) {
+                tracepoint_probe_unregister(tp_irq_threaded_handler_entry, probe_irq_threaded_handler_entry, NULL);
         }
-        if (tp_irq_thread_end_processing) {
-                tracepoint_probe_unregister(tp_irq_thread_end_processing, irq_handler_fn_exit_handler, NULL);
+        if (tp_irq_threaded_handler_exit) {
+                tracepoint_probe_unregister(tp_irq_threaded_handler_exit, probe_irq_threaded_handler_exit, NULL);
         }
 
         // Wait so that probe function is not still running on other cores
@@ -725,9 +724,9 @@ static void __exit rt_module_exit(void)
                         if (smp_load_acquire(&curr->active) == true) {
                                 if (strncmp(curr->comm, "irq/", 4) == 0) {
                                         pr_info("IRQ %s (PID=%d):\n", curr->comm, i);
-                                        pr_info("  service_time_min/max (wake->first sleep): %lld / %lld ns\n", curr->resp_min_ns, curr->resp_max_ns);
-                                        pr_info("  latency_min/max (wake->first run): %lld / %lld ns\n", curr->min_ns, curr->max_ns);
-                                        pr_info("  per interrupt bottom half handling time (single iteration): %lld / %lld ns\n", curr->interrupt_handler_min_ns, curr->interrupt_handler_max_ns);
+                                        pr_info("  service_time_min/max (wake->first sleep): %lld / %lld ns\n", curr->rt_voluntary_min_ns, curr->rt_voluntary_max_ns);
+                                        pr_info("  latency_min/max (wake->first run): %lld / %lld ns\n", curr->latency_min_ns, curr->latency_max_ns);
+                                        pr_info("  per interrupt bottom half handling time (single iteration): %lld / %lld ns\n", curr->irq_handle_min_ns, curr->irq_handle_max_ns);
 
                                         struct task_stat_slo *v = &curr->v;
                                         if (v->latency_violations) {
@@ -743,10 +742,10 @@ static void __exit rt_module_exit(void)
                                 else {
                                         pr_info(
                                                 "jerry_rt_module: PID=%d, Name=%s, minLat=%lli, maxLat=%lli,\nminResponseTimeVoluntarySleepAllTypes=%lli, maxResponseTimeVoluntarySleepAllTypes=%lli, \nminResponseTimeVoluntarySleepReliefBased=%lli, maxResponseTimeVoluntarySleepReliefBased=%lli", 
-                                                i, curr->comm, READ_ONCE(curr->min_ns), 
-                                                READ_ONCE(curr->max_ns), 
-                                                READ_ONCE(curr->resp_min_ns), READ_ONCE(curr->resp_max_ns), 
-                                                READ_ONCE(curr->resp_cycle_min_ns), READ_ONCE(curr->resp_cycle_max_ns)
+                                                i, curr->comm, READ_ONCE(curr->latency_min_ns), 
+                                                READ_ONCE(curr->latency_max_ns), 
+                                                READ_ONCE(curr->rt_voluntary_min_ns), READ_ONCE(curr->rt_voluntary_max_ns), 
+                                                READ_ONCE(curr->rt_relief_min_ns), READ_ONCE(curr->rt_relief_max_ns)
                                         );
 
                                         struct task_stat_slo *v = &curr->v;
