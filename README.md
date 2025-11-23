@@ -249,4 +249,43 @@ For 2, only the first voluntary sleep version captures something (a little bit) 
 
 For 3, only the first voluntary sleep version of response time would be useful. This captures the whole cycle.
 
+## The third part - interrupts
 
+Interrupts are an important part of RT. 
+
+According to Grantt, there is a main control loop would congest hardware information, but rarely block, because hardware information is brought to the control loop using IRQ handlers, and the main loop would just access shared memory to get information. Good design control loops pretty much don't block.
+
+IRQ handlers would be set at a higher priority. So, the moment the IRQ line is pulled, they are handled ASAP, allowing for data to be put into shared memory. When the control loop is run, it wouldn't have to wait for data by design.
+
+Aside from hardware data collection and the main loop, there will be other background userspace tasks. 
+
+For example, there are driver threads, which watch fro the commands that the control loop would send over and act on them. There can be a telemetry thread which sends data to the ground station, and writes all this data to the SD card.
+
+Therefore, we would like to make sure that: 
+IRQ handlers, userspace tasks and the control loop, are all gotten to by Linux on time and there are no outrageous delays that exist in our system.
+
+Since we are in the IRQ section lets talk about that.
+
+We register a IRQ line to a particular action that should be performed (an irqaction). 
+
+This allows Linux to create a dedicated thread, which effectively just contains a infinite loop with our IRQ handler in it and sleeps when there is no line pulls that need to be handled.
+
+Then, when the IRQ line is pulled by the hardware, the top half is first ran in hardirq context. Only after, the our irq handling thread is woken up and our according handler would run. After our handler runs, if there are no more interrupts, that thread sleeps again.
+
+Therefore, to get a gauge of how fast we start to address an irq, we can track latency of running the irq thread.
+
+To get a gauge of how fast we handle individual interrupts though, we can use a voluntary sleep response time. Since the thread would effectively wake upon having an interrupt to handle and sleep when there are no more interrupts to handle, for a single interrupt, this would effectively measure the time taken to handle.
+
+However, through experimentation, I found that there could be potentially be interrupt storms (where another irq pull happens while we were handling the last irq in the loop body). This causes the irq thread to continue looping without sleeping after handing each interrupt. 
+
+Therefore response time doesn't capture this case where multiple interrupts happen.
+
+Case 2 - Additionally, potentially the IRQ handler function blocks. Therefore the first sleep may not capture the full duration of a single handle given an absence of an interrupt storm.
+
+Due to these two cases, I made a kernel patch to add in tracepoints to the irq handling thread. Each iteration is a single handle, therefore, these tracepoints just track the loop body.
+
+This allows me to hook into gauge how long an individual irq pull for this particular irqaction is handled. I tabulate the min max for this.
+
+
+
+The concern, there could be an other case, where we have an irq storm, and multiple (a lot of the same) interrupts arrive at t0. Then the irq handler starts handling them. Since IRQ handling goes sequentially, potentially each one takes a little bit to handle, and eventually it gets to the last one, and it gets handled. Despite each interrupt being handled in a short time, it is the latency for the last interrupt that we are concerned about since it waited a long time (we don't measure this since the thread didn't sleep).
