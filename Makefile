@@ -2,6 +2,8 @@
 
 obj-m := jerry_rt_module.o
 
+jerry_rt_module-objs := rt_main.o trace_ring_buffer.o
+
 MODULE_NAME := jerry_rt_module
 
 all:

@@ -13,8 +13,10 @@
 #include <linux/sysfs.h>
 #include <linux/interrupt.h>
 #include <asm/unistd.h>
+#include "trace_ring_buffer.h"
 
 #define PIDTAB_SIZE 65536
+
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Jerry Qi");
@@ -92,7 +94,6 @@ struct task_latency_entry {
         // SLO implementation
         struct task_stat_slo v;
 };
-
 
 
 
@@ -677,6 +678,14 @@ static int __init rt_module_init(void)
                 return -EINVAL;
         }
 
+        // Creating the SLO queue
+        int ret = slo_queue_init();
+        if (ret) {
+                pr_info("Failed to initialize slo tracing queue");
+                return -1;
+        }
+        pr_info("Slo tracing queue loaded");
+
         // Registering the attribute group
         rt_kobj = kobject_create_and_add("jerry_rt_module", kernel_kobj);
         if (!rt_kobj) {
@@ -760,6 +769,8 @@ static void __exit rt_module_exit(void)
                 }
                 vfree(pidtab);
         }
+
+        slo_queue_exit();
 
         sysfs_remove_groups(rt_kobj, rt_groups);
         kobject_put(rt_kobj);
