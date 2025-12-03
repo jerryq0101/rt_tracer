@@ -10,18 +10,15 @@
 
 // Understand what prev_state is
 struct sched_switch_info {
-        char name[TASK_COMM_LEN];
+        char prev_name[TASK_COMM_LEN];
+        char next_name[TASK_COMM_LEN];
         bool preempt;
         unsigned int prev_state;
-        int on_cpu;
-        int recent_used_cpu;
-        int wake_cpu;
+        int event_cpu;
 
-        // General knowledge about the task
-        int prio;
-        int static_prio;
-        int normal_prio;
-        unsigned int rt_priority;
+        // Priorities
+        int prev_prio;
+        int next_prio;
 };
 
 struct sched_wakeup_info {
@@ -31,9 +28,6 @@ struct sched_wakeup_info {
 
         // General knowledge about the Task
         int prio;
-        int static_prio;
-        int normal_prio;
-        unsigned int rt_priority;
 };
 
 struct sys_sleep_info {
@@ -56,16 +50,22 @@ struct slo_event {
         };
 };
 
+struct event_ring {
+        struct slo_event buf[QUEUE_LEN];
+        u64 head_seq;
+        u64 tail_seq;
+        // ring wraps, tail will indicate the oldest event before the head.
+        spinlock_t lock;
+};
+
 /*
 Functions that are needed 
 */
 int slo_queue_init(void);
 void slo_queue_exit(void);
 
-int slo_queue_push(const struct slo_event *ev);
-int slo_queue_pop(struct slo_event *ev);
+int slo_queue_push(struct slo_event ev);
 
-bool slo_queue_empty(void);
-bool slo_queue_full(void);
+extern struct event_ring event_queue;
 
 #endif

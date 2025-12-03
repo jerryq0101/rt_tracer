@@ -2,74 +2,51 @@
 #include <linux/slab.h>
 #include "trace_ring_buffer.h"
 
-static DECLARE_KFIFO(event_fifo, struct slo_event, QUEUE_LEN);
-static spinlock_t event_fifo_lock;                                      // events (diff pids) can be added at same time.
+struct event_ring event_queue;                          // static memory
 
 int slo_queue_init(void)
 {
-        spin_lock_init(&event_fifo_lock);
+        spin_lock_init(&event_queue.lock);
+        event_queue.head_seq = 1;
+        event_queue.tail_seq = 0;
+        // buf is initialized to 0s, as event_queue is in static memory
         return 0;
 }
 
+/**
+ * In case I do some heap allocation
+ */
 void slo_queue_exit(void)
 {
 
 }
 
-int slo_queue_push(const struct slo_event *ev)
+/**
+ * Pushes a slo event into the queue, and returns the index of push.
+ */
+// pass in slo_event by value (scoping will free this, and it will free the caller's as well, so only the event queue one remains)
+int slo_queue_push(struct slo_event ev)
 {
         unsigned long flags;
         unsigned int copied;
 
-        spin_lock_irqsave(&event_fifo_lock, flags);
-        copied = kfifo_in(&event_fifo, ev, 1);
+        spin_lock_irqsave(&event_queue.lock, flags);
+        // Storing
+        u64 head = event_queue.head_seq;
+        // store a copy
+        event_queue.buf[head % QUEUE_LEN] = ev;
+        event_queue.head_seq = (head++) % QUEUE_LEN;
 
-        if (copied == 0)        // 0 bytes successfully inserted
-        {
-                struct slo_event dummy;
-                slo_queue_pop(&dummy);
-                copied = kfifo_in(&event_fifo, ev, 1);
+        // Updating tail (if head caught up to tail)
+        u64 tail = event_queue.tail_seq;
+        if (head == tail) {
+                event_queue.tail_seq = (tail++) % QUEUE_LEN;
         }
-        spin_unlock_irqrestore(&event_fifo_lock, flags);
+        spin_unlock_irqrestore(&event_queue.lock, flags);
 
-        return (copied == 1) ? 0 : -ENOSPC;
+        return head;
 }
 
-int slo_queue_pop(struct slo_event *ev)
-{
-        unsigned long flags;
-        unsigned int removed;
-
-        spin_lock_irqsave(&event_fifo_lock, flags);
-        removed = kfifo_out(&event_fifo, ev, 1);
-        spin_unlock_irqrestore(&event_fifo_lock, flags);
-
-        return (removed == 1) ? 0 : -ENOSPC;
-}
-
-
-bool slo_queue_empty()
-{
-        return ((kfifo_avail(&event_fifo) / sizeof(struct slo_event)) == QUEUE_LEN);
-}
-
-bool slo_queue_full()
-{
-        return kfifo_avail(&event_fifo) == 0;
-}
-
-
-// TODO: make a function that basically goes through and gets all the events out.
-/*
-
-Slo violation triggering.
-
-Good case: begin is inside of the ring buffer, end is around the end of the ring buffer
-
-I'd have to find begin inside the ring buffer somehow. also finding the end to secure the region.
-
-
-*/
 
 /**
  * fetch an array of slo events from beginning to end, relevant region. 

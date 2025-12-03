@@ -16,7 +16,8 @@
 #include "trace_ring_buffer.h"
 
 #define PIDTAB_SIZE 65536
-
+#define MAX_TRACED_PIDS 10
+#define MAX_TRACE_LEN_PER_SLO 10
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Jerry Qi");
@@ -46,18 +47,30 @@ struct task_stat_slo {
         // For Latency
         s64 latency_bound;
         int latency_violations;
+        int max_l_start_index;
+        s64 max_l_start_index_time;
+        struct slo_event *max_l_violation_trace;
         
         // For Response time voluntary sleep
         s64 response_bound;
         int response_violations;
+        int max_r_start_index;
+        s64 max_r_start_index_time;
+        struct slo_event *max_rt_violation_trace;
         
         // Response time relief sleep
         s64 response_relief_bound;
         int response_relief_violations;
+        int max_rr_start_index;
+        s64 max_rr_start_index_time;
+        struct slo_event *max_rtr_violation_trace;
         
         // IRQ tracepoints
         s64 irq_handling_bound;
         int irq_handling_violations;
+        int max_i_start_index;
+        s64 max_i_start_index_time;
+        struct slo_event *max_irqt_violation_trace;
 };
 
 struct task_latency_entry {
@@ -93,8 +106,8 @@ struct task_latency_entry {
         
         // SLO implementation
         struct task_stat_slo v;
+        bool trace_enabled;
 };
-
 
 
 static void update_violation(enum stat_field field, s64 value, struct task_latency_entry *e);
@@ -163,7 +176,7 @@ static __always_inline void update_minmax(enum stat_field choice,
 /*
 Adding a pid to be recorded, and removing a pid to be recorded
 */
-static int start_recording_pid(pid_t pid)
+static int start_recording_pid(pid_t pid, bool traced)
 {
         struct task_latency_entry *e = slot_for(pid);
         if (!e) {
@@ -190,6 +203,8 @@ static int start_recording_pid(pid_t pid)
         WRITE_ONCE(e->last_handler_call_entry, 0);
         WRITE_ONCE(e->irq_handle_max_ns, 0);
         WRITE_ONCE(e->irq_handle_min_ns, LLONG_MAX);
+        WRITE_ONCE(e->trace_enabled, true);
+
         // SLO violation
         WRITE_ONCE(e->v.latency_bound, LLONG_MAX);
         WRITE_ONCE(e->v.latency_violations, 0);
@@ -199,6 +214,18 @@ static int start_recording_pid(pid_t pid)
         WRITE_ONCE(e->v.response_relief_violations, 0);
         WRITE_ONCE(e->v.irq_handling_bound, LLONG_MAX);
         WRITE_ONCE(e->v.irq_handling_violations, 0);
+
+        // Allocate if trace is enabled
+        if (READ_ONCE(e->trace_enabled) == true) {
+                struct slo_event *latencyslo = kzalloc(MAX_TRACE_LEN_PER_SLO * sizeof(struct slo_event), GFP_KERNEL);
+                struct slo_event *rtslo = kzalloc(MAX_TRACE_LEN_PER_SLO * sizeof(struct slo_event), GFP_KERNEL);
+                struct slo_event *rt_reliefslo = kzalloc(MAX_TRACE_LEN_PER_SLO * sizeof(struct slo_event), GFP_KERNEL);
+                struct slo_event *irqslo = kzalloc(MAX_TRACE_LEN_PER_SLO * sizeof(struct slo_event), GFP_KERNEL);
+                WRITE_ONCE(e->v.max_l_violation_trace, latencyslo);
+                WRITE_ONCE(e->v.max_rt_violation_trace, rtslo);
+                WRITE_ONCE(e->v.max_rtr_violation_trace, rt_reliefslo);
+                WRITE_ONCE(e->v.max_irqt_violation_trace, irqslo);
+        }
 
         // Set PID's name
         struct task_struct *p = pid_task(find_vpid(pid), PIDTYPE_PID);
@@ -223,6 +250,18 @@ static void stop_recording_pid(pid_t pid)
                 return;
         }
 
+        if (READ_ONCE(e->trace_enabled) == true) {
+                void *latencyslo = READ_ONCE(e->v.max_l_violation_trace);
+                void *rtslo = READ_ONCE(e->v.max_rt_violation_trace);
+                void *rt_reliefslo = READ_ONCE(e->v.max_rtr_violation_trace);
+                void *irqtslo = READ_ONCE(e->v.max_irqt_violation_trace);
+
+                kfree(latencyslo);
+                kfree(rtslo);
+                kfree(rt_reliefslo);
+                kfree(irqtslo);
+        }
+
         // For visibility when the tracepoint is fired immediately after.
         smp_store_release(&e->active, false);
 }
@@ -235,6 +274,21 @@ Task is running
 */
 static void probe_sched_switch(void *data, bool preempt, struct task_struct *prev, struct task_struct *next, unsigned int prev_state)
 {
+        // Record sched_switch event on ring
+        struct slo_event switch_event = {
+                SCHED_SWITCH,
+                {
+                        prev->comm,
+                        next->comm,
+                        preempt,
+                        prev_state,
+                        smp_processor_id(),
+                        prev->prio,
+                        next->prio
+                }
+        };
+        slo_queue_push(switch_event);
+        
         // Track latency statistics for the next task switched into 
         struct task_latency_entry *e = slot_for(next->pid);
         s64 wu, now;
@@ -293,11 +347,22 @@ Function that would be called when sched_wakeup happens.
 */
 static void probe_sched_wakeup(void *data, struct task_struct *p)
 {
+        // Record event into ring buffer
+        struct slo_event wakeup_event = {
+                SCHED_WAKEUP,
+                {
+                        p->comm,
+                        smp_processor_id(),
+                        p->recent_used_cpu,
+                        p->prio
+                }
+        };
+        int store_index = slo_queue_push(wakeup_event);
         struct task_latency_entry *e = slot_for(p->pid);
-        // set the specific number for last latency
         if (!e) {
                 return;
         }
+
         if (smp_load_acquire(&e->active) == false) {
                 return;
         }
@@ -307,11 +372,20 @@ static void probe_sched_wakeup(void *data, struct task_struct *p)
 
         s64 now = ktime_get_ns();
         WRITE_ONCE(e->latency_last_wakeup_ns, now);
+        // index that indicates wake up to switch in.
+        if (READ_ONCE(e->trace_enabled)) {
+                WRITE_ONCE(e->v.max_l_start_index, store_index);
+                WRITE_ONCE(e->v.max_r_start_index, store_index);
+        }
 
-        // Validate this assumption later
         if (READ_ONCE(e->last_sleep_cause) == SC_TIMER) {
                 WRITE_ONCE(e->cycle_active, true);
                 WRITE_ONCE(e->cycle_start_ns, now);
+
+                // index that indicates from wakeup (until relief sleep)
+                if (READ_ONCE(e->trace_enabled)) {
+                        WRITE_ONCE(e->v.max_rr_start_index, store_index);
+                }
         }
 }
 
@@ -351,6 +425,16 @@ static void probe_sys_enter(void *data, struct pt_regs *regs, long id)
         if (!e || smp_load_acquire(&e->active) == false) {
                 return;
         }
+        
+        // Record this as an event onto ring buffer
+        struct slo_event sleep_event = {
+                SYS_SLEEP,
+                {
+                        e->comm
+                }
+        };
+        slo_queue_push(sleep_event);
+
 
         WRITE_ONCE(e->scause, SC_TIMER);
 }
@@ -366,6 +450,9 @@ static void probe_irq_threaded_handler_entry(void *data, int irq, struct irqacti
                 struct task_struct *irq_thread = action->thread;
                 pid_t pid = irq_thread->pid;
                 struct task_latency_entry *e = slot_for(pid);
+                if (READ_ONCE(e->trace_enabled)) {
+                        WRITE_ONCE(e->v.max_i_start_index, event_queue.head_seq);
+                }
                 
                 if (e && smp_load_acquire(&e->active)) {
                         WRITE_ONCE(e->last_handler_call_entry, ktime_get_ns());
@@ -412,6 +499,7 @@ static void update_violation(enum stat_field field, s64 value, struct task_laten
                         bound = READ_ONCE(e->v.latency_bound);
                         if (value > bound) {
                                 WRITE_ONCE(e->v.latency_violations, READ_ONCE(e->v.latency_violations) + 1);
+                                collect_latency_violation_trace();
                         }
                 case RESPONSE:
                         bound = READ_ONCE(e->v.response_bound);
@@ -431,6 +519,28 @@ static void update_violation(enum stat_field field, s64 value, struct task_laten
                 default:
                         break;
         }
+}
+
+/**
+ * Checks if the ring still contains full trace
+ * If not: then return
+ * If yes: then collect and put it into the buffer
+ * 
+ * PRECONDITION: pid is an active element 
+ */
+int collect_latency_violation_trace(pid_t pid) {
+        u64 head = event_queue.head_seq;
+        u64 tail = event_queue.tail_seq;
+        
+        // how to check if path didn't get polluted
+        // [.less than t is also good...t.... ahead of t is good]
+        
+        struct task_latency *e = slot_for(pid);
+        if (READ_ONCE(e->trace_enabled)) {
+                // Get the latency index time to check if it matches or its been replaced
+                // 
+        }
+        
 }
 
 
@@ -454,14 +564,36 @@ static void find_tp(struct tracepoint *tp, void *priv)
 
 /*
 Kernel sysfs input handling
+
+Check here if we need to trace for this pid.
+echo "3452 trace" > /sys/kernel/jerry_rt_module/add_pid
+
+Remove pid is still the same, but now we need to free the arr in remove, and also rmmod.
 */
-static ssize_t add_pid_store(struct kobject *kobj, struct kobj_attribute *attr,
+static ssize_t add_pid_store(struct kobject *kobj,
+                                struct kobj_attribute *attr,
                                 const char *buf, size_t count)
 {
-        pid_t pid;
-        if (kstrtoint(buf, 10, &pid) == 0) {
-                start_recording_pid(pid);
+        int pid;
+        char cmd[16] = {0};
+
+        int n = sscanf(buf, "%d %15s", &pid, cmd);
+        
+        if (n == 1)             // No trace
+        {
+                start_recording_pid(pid, false);
+        } else if (n == 2)      // Yes trace
+        {
+                if (!strcmp(cmd, "trace")) {
+                        start_recording_pid(pid, true);
+                }
+                else {
+                        pr_warn("Unknown command: %s\n", cmd);
+                }
+        } else {
+                pr_warn("Bad format: expected 'pid' or 'pid trace'\n");
         }
+
         return count;
 }
 
