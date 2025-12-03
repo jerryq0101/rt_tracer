@@ -93,6 +93,9 @@ struct task_latency_entry {
         struct task_stat_slo v;
 };
 
+
+
+
 static void update_violation(enum stat_field field, s64 value, struct task_latency_entry *e);
 
 #define DEFINE_SLO_SETTER(name, field) \
@@ -119,15 +122,6 @@ static inline struct task_latency_entry *slot_for(pid_t pid)
 /*
 Helper functions
 */
-// static __always_inline void update_minmax(struct task_latency_entry *e, s64 v)
-// {
-//         if (READ_ONCE(e->latency_max_ns) < v) {
-//                 WRITE_ONCE(e->latency_max_ns, v);
-//         }
-//         if (v < READ_ONCE(e->latency_min_ns)) {
-//                 WRITE_ONCE(e->latency_min_ns, v);
-//         }
-// }
 
 #define UPDATE_MINMAX_FIELD(e, v, min_field, max_field)         \
         do {                                                    \
