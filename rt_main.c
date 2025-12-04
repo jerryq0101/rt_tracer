@@ -110,8 +110,8 @@ struct task_latency_entry {
 };
 
 
-static void update_violation(enum stat_field field, s64 value, struct task_latency_entry *e);
-int collect_latency_violation_trace(struct task_latency_entry *e);
+static void update_violation(enum stat_field field, s64 value, struct task_latency_entry *e, int violation_event_index);
+int collect_latency_violation_trace(struct task_latency_entry *e, int violation_event_index);
 
 #define DEFINE_SLO_SETTER(name, field) \
 static void set_##name(pid_t pid, s64 value) { \
@@ -285,7 +285,7 @@ static void probe_sched_switch(void *data, bool preempt, struct task_struct *pre
         switch_event.event.switch_info.event_cpu = smp_processor_id();
         switch_event.event.switch_info.prev_prio = prev->prio;
         switch_event.event.switch_info.next_prio = next->prio;
-        slo_queue_push(switch_event);
+        int switch_index = slo_queue_push(switch_event);
         
         // Track latency statistics for the next task switched into 
         struct task_latency_entry *e = slot_for(next->pid);
@@ -297,7 +297,7 @@ static void probe_sched_switch(void *data, bool preempt, struct task_struct *pre
                         now = ktime_get_ns();
                         s64 delta = now - wu;
                         update_minmax((enum stat_field) LATENCY, e, delta);
-                        update_violation((enum stat_field) LATENCY, delta, e);
+                        update_violation((enum stat_field) LATENCY, delta, e, switch_index);
                         
                         // Write down the last wake up time used (this is for response time)
                         WRITE_ONCE(e->curr_wu_ns, wu);
@@ -324,7 +324,7 @@ static void probe_sched_switch(void *data, bool preempt, struct task_struct *pre
                         if (wu) {
                                 s64 resp = now - wu;
                                 update_minmax((enum stat_field) RESPONSE, p, resp);
-                                update_violation((enum stat_field) RESPONSE, resp, p);
+                                update_violation((enum stat_field) RESPONSE, resp, p, 0);
                         }
 
                         if (vol_sleep_cause == SC_TIMER && READ_ONCE(p->cycle_active)) {
@@ -332,7 +332,7 @@ static void probe_sched_switch(void *data, bool preempt, struct task_struct *pre
                                 if (cs) {
                                         s64 cycle = now - cs;
                                         update_minmax((enum stat_field) RESPONSE_RELIEF, p, cycle);
-                                        update_violation((enum stat_field) RESPONSE_RELIEF, cycle, p);
+                                        update_violation((enum stat_field) RESPONSE_RELIEF, cycle, p, 0);
                                 }
                                 WRITE_ONCE(p->cycle_active, false);
                         }
@@ -469,7 +469,7 @@ static void probe_irq_threaded_handler_exit(void *data, int irq, struct irqactio
                         if (le != 0) {
                                 s64 delta = ktime_get_ns() - le;
                                 update_minmax((enum stat_field) IRQ_HANDLING, e, delta);
-                                update_violation((enum stat_field) IRQ_HANDLING, delta, e);
+                                update_violation((enum stat_field) IRQ_HANDLING, delta, e, 0);
                         }
                 }
         }
@@ -481,9 +481,10 @@ static void probe_irq_threaded_handler_exit(void *data, int irq, struct irqactio
  * Function to update violation status for a particular field
  * @field is the specific metric that this value is applicable for
  * 
+ * violation_event_index points to the event that completed this SLO. 
  * 
  */
-static void update_violation(enum stat_field field, s64 value, struct task_latency_entry *e) {
+static void update_violation(enum stat_field field, s64 value, struct task_latency_entry *e, int violation_event_index) {
         s64 bound;
         switch (field) {
                 case LATENCY:
@@ -494,7 +495,7 @@ static void update_violation(enum stat_field field, s64 value, struct task_laten
                         if (value > bound) {
                                 WRITE_ONCE(e->v.latency_violations, READ_ONCE(e->v.latency_violations) + 1);
                                 // pr_info("Collect latency violation trace!\n");
-                                collect_latency_violation_trace(e);
+                                collect_latency_violation_trace(e, violation_event_index);
                         }
                         break;
                 case RESPONSE:
@@ -525,9 +526,11 @@ static void update_violation(enum stat_field field, s64 value, struct task_laten
  * If not: then return
  * If yes: then collect and put it into the buffer
  * 
+ * violation_event_index is the index which completed this SLO.
+ * 
  * PRECONDITION: pid is an active element 
  */
-int collect_latency_violation_trace(struct task_latency_entry *e) {
+int collect_latency_violation_trace(struct task_latency_entry *e, int violation_event_index) {
         if (READ_ONCE(e->trace_enabled)) {
                 unsigned int flags;
                 spin_lock_irqsave(&event_queue.lock, flags);
@@ -543,21 +546,18 @@ int collect_latency_violation_trace(struct task_latency_entry *e) {
                 }
                 // Tail hasn't gone past our element, save this part of the trace
                 struct slo_event *arr = e->v.max_l_violation_trace;
-                // DEBUG SHITS
-                // pr_info("Processing violation trace, start index: %lld\n", index);
-
                 int len = 0;
 
-                for (int i = index; i < head && i < index+MAX_TRACE_LEN_PER_SLO; i++, len++) {
+                for (int i = index; i <= violation_event_index && len < MAX_TRACE_LEN_PER_SLO; i++, len++) {
                         struct slo_event *se = &event_queue.buf[i % QUEUE_LEN];
                         arr[len] = *se;
                         // if satisfied the ending condition of latency
-                        if (se->type == SCHED_SWITCH && se->event.switch_info.next_pid == e->pid)
-                        {
-                                break;
-                        }
+                        // if (se->type == SCHED_SWITCH && se->event.switch_info.next_pid == e->pid)
+                        // {
+                        //         break;
+                        // }
                 }
-                WRITE_ONCE(e->v.max_l_trace_len, len+1);
+                WRITE_ONCE(e->v.max_l_trace_len, len);
                 spin_unlock_irqrestore(&event_queue.lock, flags);
                 return 0;
         }
