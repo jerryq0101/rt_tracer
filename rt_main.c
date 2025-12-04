@@ -48,24 +48,28 @@ struct task_stat_slo {
         s64 latency_bound;
         int latency_violations;
         int max_l_start_index;
+        int max_l_trace_len;
         struct slo_event *max_l_violation_trace;
         
         // For Response time voluntary sleep
         s64 response_bound;
         int response_violations;
         int max_r_start_index;
+        int max_r_trace_len;
         struct slo_event *max_rt_violation_trace;
         
         // Response time relief sleep
         s64 response_relief_bound;
         int response_relief_violations;
         int max_rr_start_index;
+        int max_rr_trace_len;
         struct slo_event *max_rtr_violation_trace;
         
         // IRQ tracepoints
         s64 irq_handling_bound;
         int irq_handling_violations;
         int max_i_start_index;
+        int max_i_trace_len;
         struct slo_event *max_irqt_violation_trace;
 };
 
@@ -366,7 +370,7 @@ static void probe_sched_wakeup(void *data, struct task_struct *p)
         WRITE_ONCE(e->latency_last_wakeup_ns, now);
         // index that indicates wake up to switch in.
         if (READ_ONCE(e->trace_enabled) == true) {
-                pr_info("Are we putting down a new start index??\n");
+                // pr_info("Are we putting down a new start index??\n");
                 WRITE_ONCE(e->v.max_l_start_index, store_index);
                 WRITE_ONCE(e->v.max_r_start_index, store_index);
         }
@@ -484,30 +488,33 @@ static void update_violation(enum stat_field field, s64 value, struct task_laten
         switch (field) {
                 case LATENCY:
                         /**
-                         * This value update was intended for latency
+                         * This value update is intended for latency
                          */
                         bound = READ_ONCE(e->v.latency_bound);
                         if (value > bound) {
                                 WRITE_ONCE(e->v.latency_violations, READ_ONCE(e->v.latency_violations) + 1);
-                                
-                                pr_info("Collect latency violation trace!\n");
+                                // pr_info("Collect latency violation trace!\n");
                                 collect_latency_violation_trace(e);
                         }
+                        break;
                 case RESPONSE:
                         bound = READ_ONCE(e->v.response_bound);
                         if (value > bound) {
                                 WRITE_ONCE(e->v.response_violations, READ_ONCE(e->v.response_violations) + 1);
                         }
+                        break;
                 case RESPONSE_RELIEF:
                         bound = READ_ONCE(e->v.response_relief_bound);
                         if (value > bound) {
                                 WRITE_ONCE(e->v.response_relief_violations, READ_ONCE(e->v.response_relief_violations) + 1);
                         }
+                        break;
                 case IRQ_HANDLING:
                         bound = READ_ONCE(e->v.irq_handling_bound);
                         if (value > bound) {
                                 WRITE_ONCE(e->v.irq_handling_violations, READ_ONCE(e->v.irq_handling_violations) + 1);
                         }
+                        break;
                 default:
                         break;
         }
@@ -521,9 +528,6 @@ static void update_violation(enum stat_field field, s64 value, struct task_laten
  * PRECONDITION: pid is an active element 
  */
 int collect_latency_violation_trace(struct task_latency_entry *e) {
-        // how to check if path didn't get polluted
-        // [.less than t is also good...t.... ahead of t is good]
-        
         if (READ_ONCE(e->trace_enabled)) {
                 unsigned int flags;
                 spin_lock_irqsave(&event_queue.lock, flags);
@@ -533,30 +537,27 @@ int collect_latency_violation_trace(struct task_latency_entry *e) {
                 if (tail > index)       // Tail has already went past our element
                 {
                         // We won't record this because trace is broken
-                        pr_info("max_l_index got polluted?\n");
+                        // pr_info("max_l_index got polluted?\n");
                         spin_unlock_irqrestore(&event_queue.lock, flags);
                         return -1;
                 }
                 // Tail hasn't gone past our element, save this part of the trace
                 struct slo_event *arr = e->v.max_l_violation_trace;
                 // DEBUG SHITS
-                pr_info("Processing violation trace, start index: %lld\n", index);
-                for (int i = index; i < head && i < index+MAX_TRACE_LEN_PER_SLO; i++) {
+                // pr_info("Processing violation trace, start index: %lld\n", index);
+
+                int len = 0;
+
+                for (int i = index; i < head && i < index+MAX_TRACE_LEN_PER_SLO; i++, len++) {
                         struct slo_event *se = &event_queue.buf[i % QUEUE_LEN];
-                        // DEBUG SHITS
-                        if (index == i) {
-                                pr_info("First element of trace type: %d\n", se->type);
-                                if (se->type == SCHED_WAKEUP) {
-                                        pr_info("more stuff: pid: %d\n", se->event.wakeup_info.pid);
-                                }
-                        }
-                        arr[i-index] = *se;
+                        arr[len] = *se;
                         // if satisfied the ending condition of latency
-                        if (se->type == SCHED_WAKEUP && se->event.wakeup_info.pid == e->pid)
+                        if (se->type == SCHED_SWITCH && se->event.switch_info.next_pid == e->pid)
                         {
                                 break;
                         }
                 }
+                WRITE_ONCE(e->v.max_l_trace_len, len+1);
                 spin_unlock_irqrestore(&event_queue.lock, flags);
                 return 0;
         }
@@ -602,12 +603,12 @@ static ssize_t add_pid_store(struct kobject *kobj,
         if (n == 1)             // No trace
         {
                 start_recording_pid(pid, false);
-                pr_info("Added pid %d, no trace\n", pid);
+                // pr_info("Added pid %d, no trace\n", pid);
         } else if (n == 2)      // Yes trace
         {
                 if (!strcmp(cmd, "trace")) {
                         start_recording_pid(pid, true);
-                        pr_info("Added pid %d, with trace\n", pid);
+                        // pr_info("Added pid %d, with trace\n", pid);
                 }
                 else {
                         pr_warn("Unknown command: %s\n", cmd);
@@ -909,12 +910,22 @@ static void __exit rt_module_exit(void)
                                         if (v->latency_violations) {
                                                 pr_info("  LatencyBound=%lld, Violations=%lld\n", v->latency_bound, v->latency_violations);
                                                 pr_info("LATENCY VIOLATION TRACE: \n");
-                                                for (int i = 0; i < MAX_TRACE_LEN_PER_SLO; i++) {
+
+                                                int len = READ_ONCE(v->max_l_trace_len);
+                                                for (int i = 0; i < len; i++) {
                                                         struct slo_event event = v->max_l_violation_trace[i];
                                                         if (event.type == SCHED_SWITCH) {
-                                                                pr_info("Event: sched_switch, prev_pid: %d, next_pid: %d, on_cpu: %d\n", event.event.switch_info.prev_pid, event.event.switch_info.next_pid, event.event.switch_info.event_cpu);
+                                                                pr_info("Event: sched_switch, prev_pid: %d, next_pid: %d, on_cpu: %d\n",
+                                                                        event.event.switch_info.prev_pid,
+                                                                        event.event.switch_info.next_pid,
+                                                                        event.event.switch_info.event_cpu);
                                                         } else if (event.type == SCHED_WAKEUP) {
-                                                                pr_info("Event: sched_wakeup, pid: %d, wake_cpu: %d\n", event.event.wakeup_info.pid, event.event.wakeup_info.wake_cpu);
+                                                                pr_info("Event: sched_wakeup, pid: %d, wake_cpu: %d\n",
+                                                                        event.event.wakeup_info.pid,
+                                                                        event.event.wakeup_info.wake_cpu);
+                                                        } else if (event.type == SYS_SLEEP) {
+                                                                pr_info("Event: sys_sleep, pid: %d\n",
+                                                                        event.event.sleep_info.pid);
                                                         }
                                                 }
                                         }
