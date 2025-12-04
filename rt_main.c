@@ -112,6 +112,7 @@ struct task_latency_entry {
 
 static void update_violation(enum stat_field field, s64 value, struct task_latency_entry *e, int violation_event_index);
 int collect_latency_violation_trace(struct task_latency_entry *e, int violation_event_index);
+int collect_response_violation_trace(struct task_latency_entry *entry, int violation_event_index);
 
 #define DEFINE_SLO_SETTER(name, field) \
 static void set_##name(pid_t pid, s64 value) { \
@@ -324,7 +325,7 @@ static void probe_sched_switch(void *data, bool preempt, struct task_struct *pre
                         if (wu) {
                                 s64 resp = now - wu;
                                 update_minmax((enum stat_field) RESPONSE, p, resp);
-                                update_violation((enum stat_field) RESPONSE, resp, p, 0);
+                                update_violation((enum stat_field) RESPONSE, resp, p, switch_index);
                         }
 
                         if (vol_sleep_cause == SC_TIMER && READ_ONCE(p->cycle_active)) {
@@ -332,7 +333,7 @@ static void probe_sched_switch(void *data, bool preempt, struct task_struct *pre
                                 if (cs) {
                                         s64 cycle = now - cs;
                                         update_minmax((enum stat_field) RESPONSE_RELIEF, p, cycle);
-                                        update_violation((enum stat_field) RESPONSE_RELIEF, cycle, p, 0);
+                                        update_violation((enum stat_field) RESPONSE_RELIEF, cycle, p, switch_index);
                                 }
                                 WRITE_ONCE(p->cycle_active, false);
                         }
@@ -502,12 +503,14 @@ static void update_violation(enum stat_field field, s64 value, struct task_laten
                         bound = READ_ONCE(e->v.response_bound);
                         if (value > bound) {
                                 WRITE_ONCE(e->v.response_violations, READ_ONCE(e->v.response_violations) + 1);
+                                collect_response_violation_trace(e, violation_event_index);
                         }
                         break;
                 case RESPONSE_RELIEF:
                         bound = READ_ONCE(e->v.response_relief_bound);
                         if (value > bound) {
                                 WRITE_ONCE(e->v.response_relief_violations, READ_ONCE(e->v.response_relief_violations) + 1);
+                                // collect_response_time_violation_trace(e, violation_event_index);
                         }
                         break;
                 case IRQ_HANDLING:
@@ -534,7 +537,7 @@ int collect_latency_violation_trace(struct task_latency_entry *e, int violation_
         if (READ_ONCE(e->trace_enabled)) {
                 unsigned int flags;
                 spin_lock_irqsave(&event_queue.lock, flags);
-                u64 head = event_queue.head_seq;
+                // u64 head = event_queue.head_seq;
                 u64 tail = event_queue.tail_seq;
                 u64 index = e->v.max_l_start_index;
                 if (tail > index)       // Tail has already went past our element
@@ -560,6 +563,66 @@ int collect_latency_violation_trace(struct task_latency_entry *e, int violation_
                 WRITE_ONCE(e->v.max_l_trace_len, len);
                 spin_unlock_irqrestore(&event_queue.lock, flags);
                 return 0;
+        }
+        return 0;
+}
+
+int collect_response_violation_trace(struct task_latency_entry *entry, int violation_event_index) {
+        if (READ_ONCE(entry->trace_enabled))
+        {
+                unsigned int flags;
+                spin_lock_irqsave(&event_queue.lock, flags);
+                u64 tail = event_queue.tail_seq;
+                u64 index = entry->v.max_r_start_index;
+                if (tail > index)       // Tail has already went past our element
+                {
+                        // We won't record this because trace is broken
+                        // pr_info("max_l_index got polluted?\n");
+                        spin_unlock_irqrestore(&event_queue.lock, flags);
+                        return -1;
+                }
+
+                // Case - Tail hadn't gone past our element, save this trace
+                struct slo_event *arr = entry->v.max_rt_violation_trace;
+                if (arr == NULL) {
+                        spin_unlock_irqrestore(&event_queue.lock, flags);
+                        return -1;
+                }
+
+                pid_t task_pid = entry->pid;
+                int len = 0;
+
+                for (int i = index; i <= violation_event_index && len < MAX_TRACE_LEN_PER_SLO; i++) {
+                        struct slo_event *se = &event_queue.buf[i % QUEUE_LEN];
+                        
+                        // so this encapsulates latency and also the run until the sleep
+                        // we care about teh first wakeup
+                        // I don't think we want to deal with schedule in's here
+                        // Deal only with preemptions and switch backs. 
+                        // sleep should be included.
+                        if (len == 0 && se->type == SCHED_WAKEUP) {
+                                arr[len] = *se;
+                                len = len+1;
+                        } else if (len > 0 && 
+                                se->type == SCHED_SWITCH && 
+                                (se->event.switch_info.prev_pid == task_pid || se->event.switch_info.next_pid == task_pid))
+                        {
+                                arr[len] = *se;
+                                len = len+1;
+                        } else if (len > 0 &&
+                                se->type == SYS_SLEEP &&
+                                se->event.sleep_info.pid == task_pid) 
+                        {
+                                arr[len] = *se;
+                                len = len+1;
+                        }
+                        // Only increase len when we actually add something to our trace.
+                }
+                WRITE_ONCE(entry->v.max_r_trace_len, len);
+                spin_unlock_irqrestore(&event_queue.lock, flags);
+
+                return 0;
+
         }
         return 0;
 }
@@ -930,13 +993,33 @@ static void __exit rt_module_exit(void)
                                                 }
                                         }
                                         if (v->response_violations) {
-                                                pr_info("  ResponseBound=%lld, Violations=%lld\n", v->latency_bound, v->latency_violations);
+                                                pr_info("  ResponseBound=%lld, Violations=%lld\n", v->response_bound, v->response_violations);
+                                                pr_info("RESPONSE TIME VIOLATION TRACE: \n");
+
+                                                int len = READ_ONCE(v->max_r_trace_len);
+                                                for (int i = 0; i < len; i++) {
+                                                        struct slo_event event = v->max_rt_violation_trace[i];
+                                                        if (event.type == SCHED_SWITCH) {
+                                                                pr_info("Event: sched_switch, preemption: %d, prev_pid: %d, next_pid: %d, on_cpu: %d\n",
+                                                                        event.event.switch_info.preempt,
+                                                                        event.event.switch_info.prev_pid,
+                                                                        event.event.switch_info.next_pid,
+                                                                        event.event.switch_info.event_cpu);
+                                                        } else if (event.type == SCHED_WAKEUP) {
+                                                                pr_info("Event: sched_wakeup, pid: %d, wake_cpu: %d\n",
+                                                                        event.event.wakeup_info.pid,
+                                                                        event.event.wakeup_info.wake_cpu);
+                                                        } else if (event.type == SYS_SLEEP) {
+                                                                pr_info("Event: sys_sleep, pid: %d\n",
+                                                                        event.event.sleep_info.pid);
+                                                        }
+                                                }
                                         }
                                         if (v->response_relief_violations) {
-                                                pr_info("  ResponseReliefBound=%lld, Violations=%lld\n", v->latency_bound, v->latency_violations);
+                                                pr_info("  ResponseReliefBound=%lld, Violations=%lld\n", v->response_relief_violations, v->response_relief_violations);
                                         }
                                         if (v->irq_handling_violations) {
-                                                pr_info("  IRQHandlingBound=%lld, Violations=%lld\n", v->latency_bound, v->latency_violations);
+                                                pr_info("  IRQHandlingBound=%lld, Violations=%lld\n", v->irq_handling_violations, v->irq_handling_violations);
                                         }
                                 }
                         }
