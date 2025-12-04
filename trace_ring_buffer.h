@@ -35,10 +35,20 @@ struct sys_sleep_info {
         pid_t pid;
 };
 
+struct irqt_entry_info {
+        pid_t pid;
+};
+
+struct irqt_exit_info {
+        pid_t pid;
+};
+
 enum event_type {
         SCHED_SWITCH,
         SCHED_WAKEUP,
-        SYS_SLEEP
+        SYS_SLEEP,
+        IRQT_ENTRY,
+        IRQT_EXIT,
 };
 
 struct slo_event {
@@ -47,6 +57,8 @@ struct slo_event {
                 struct sched_switch_info switch_info;
                 struct sched_wakeup_info wakeup_info;
                 struct sys_sleep_info sleep_info;
+                struct irqt_entry_info irqt_entry_info;
+                struct irqt_exit_info irqt_exit_info;
         } event;
 };
 

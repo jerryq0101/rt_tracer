@@ -114,6 +114,7 @@ static void update_violation(enum stat_field field, s64 value, struct task_laten
 int collect_latency_violation_trace(struct task_latency_entry *e, int violation_event_index);
 int collect_response_violation_trace(struct task_latency_entry *entry, int violation_event_index);
 int collect_response_time_violation_trace(struct task_latency_entry *entry, int violation_event_index);
+int collect_irqt_violation_trace(struct task_latency_entry *entry, int violation_event_index);
 
 #define DEFINE_SLO_SETTER(name, field) \
 static void set_##name(pid_t pid, s64 value) { \
@@ -442,12 +443,17 @@ Handler for IRQ tracepoints.
 static void probe_irq_threaded_handler_entry(void *data, int irq, struct irqaction *action)
 {
         if (action != NULL) {
+                struct slo_event entry_event = {0};
+                entry_event.type = IRQT_ENTRY;
+                entry_event.event.irqt_entry_info.pid = action->thread->pid;
+                int entry_index = slo_queue_push(entry_event);
+                
                 struct task_struct *irq_thread = action->thread;
                 pid_t pid = irq_thread->pid;
                 struct task_latency_entry *e = slot_for(pid);
                 if (READ_ONCE(e->trace_enabled)) {
                         // TODO might need a lock here
-                        WRITE_ONCE(e->v.max_i_start_index, event_queue.head_seq);
+                        WRITE_ONCE(e->v.max_i_start_index, entry_index);
                 }
                 
                 if (e && smp_load_acquire(&e->active)) {
@@ -459,6 +465,11 @@ static void probe_irq_threaded_handler_entry(void *data, int irq, struct irqacti
 static void probe_irq_threaded_handler_exit(void *data, int irq, struct irqaction *action)
 {
         if (action != NULL) {
+                struct slo_event exit_event = {0};
+                exit_event.type = IRQT_EXIT;
+                exit_event.event.irqt_exit_info.pid = action->thread->pid;
+                int switch_index = slo_queue_push(exit_event);
+
                 struct task_struct *irq_thread = action->thread;
                 if (irq_thread == 0) {
                         return;
@@ -471,7 +482,7 @@ static void probe_irq_threaded_handler_exit(void *data, int irq, struct irqactio
                         if (le != 0) {
                                 s64 delta = ktime_get_ns() - le;
                                 update_minmax((enum stat_field) IRQ_HANDLING, e, delta);
-                                update_violation((enum stat_field) IRQ_HANDLING, delta, e, 0);
+                                update_violation((enum stat_field) IRQ_HANDLING, delta, e, switch_index);
                         }
                 }
         }
@@ -518,6 +529,7 @@ static void update_violation(enum stat_field field, s64 value, struct task_laten
                         bound = READ_ONCE(e->v.irq_handling_bound);
                         if (value > bound) {
                                 WRITE_ONCE(e->v.irq_handling_violations, READ_ONCE(e->v.irq_handling_violations) + 1);
+                                collect_irqt_violation_trace(e, violation_event_index);
                         }
                         break;
                 default:
@@ -568,6 +580,7 @@ int collect_latency_violation_trace(struct task_latency_entry *e, int violation_
         return 0;
 }
 
+// DRY - probably implement a selector within the trace collecting loop (what particular to include?)
 int collect_response_violation_trace(struct task_latency_entry *entry, int violation_event_index) {
         if (READ_ONCE(entry->trace_enabled))
         {
@@ -628,8 +641,9 @@ int collect_response_violation_trace(struct task_latency_entry *entry, int viola
         return 0;
 }
 
+// DRY
 int collect_response_time_violation_trace(struct task_latency_entry *entry, int violation_event_index) {
-                if (READ_ONCE(entry->trace_enabled))
+        if (READ_ONCE(entry->trace_enabled))
         {
                 unsigned int flags;
                 spin_lock_irqsave(&event_queue.lock, flags);
@@ -678,6 +692,74 @@ int collect_response_time_violation_trace(struct task_latency_entry *entry, int 
                         // Only increase len when we actually add something to our trace.
                 }
                 WRITE_ONCE(entry->v.max_rr_trace_len, len);
+                spin_unlock_irqrestore(&event_queue.lock, flags);
+
+                return 0;
+        }
+        return 0;
+}
+
+// DRY!!!!
+int collect_irqt_violation_trace(struct task_latency_entry *entry, int violation_event_index) {
+        if (READ_ONCE(entry->trace_enabled))
+        {
+                unsigned int flags;
+                spin_lock_irqsave(&event_queue.lock, flags);
+                u64 tail = event_queue.tail_seq;
+                u64 index = entry->v.max_i_start_index;
+                if (tail > index)       // Tail has already went past our element
+                {
+                        // We won't record this because trace is broken
+                        spin_unlock_irqrestore(&event_queue.lock, flags);
+                        return -1;
+                }
+
+                // Case - Tail hadn't gone past our element, save this trace
+                struct slo_event *arr = entry->v.max_irqt_violation_trace;
+                if (arr == NULL) {
+                        spin_unlock_irqrestore(&event_queue.lock, flags);
+                        return -1;
+                }
+
+                pid_t task_pid = entry->pid;
+                int len = 0;
+
+                for (int i = index; i <= violation_event_index && len < MAX_TRACE_LEN_PER_SLO; i++) {
+                        struct slo_event *se = &event_queue.buf[i % QUEUE_LEN];
+                        
+                        // this encapsulates point before irqthread starts running handler,
+                        // then it might get preempted cycle, it might do a voluntary cycle or sleep, and then it ends
+                        if (len == 0 && se->type == IRQT_ENTRY) {
+                                arr[len] = *se;
+                                len = len+1;
+                        } else if (len > 0 &&
+                                se->type == SCHED_WAKEUP &&
+                                se->event.wakeup_info.pid == task_pid)
+                        {
+                                arr[len] = *se;
+                                len = len+1;
+                        } else if (len > 0 && 
+                                se->type == SCHED_SWITCH && 
+                                (se->event.switch_info.prev_pid == task_pid || se->event.switch_info.next_pid == task_pid))
+                        {
+                                arr[len] = *se;
+                                len = len+1;
+                        } else if (len > 0 &&
+                                se->type == SYS_SLEEP &&
+                                se->event.sleep_info.pid == task_pid) 
+                        {
+                                arr[len] = *se;
+                                len = len+1;
+                        } else if (len > 0 &&
+                                se->type == IRQT_EXIT &&
+                                se->event.irqt_exit_info.pid == task_pid)
+                        {
+                                arr[len] = *se;
+                                len = len+1;
+                        } 
+                        // Only increase len when we actually add something to our trace.
+                }
+                WRITE_ONCE(entry->v.max_i_trace_len, len);
                 spin_unlock_irqrestore(&event_queue.lock, flags);
 
                 return 0;
@@ -1009,12 +1091,41 @@ static void __exit rt_module_exit(void)
                                         struct task_stat_slo *v = &curr->v;
                                         if (v->latency_violations) {
                                                 pr_info("  LatencyBound=%lld, Violations=%lld", v->latency_bound, v->latency_violations);
+                                                // Can probably reuse the logic from below
                                         }
                                         if (v->response_violations) {
-                                                pr_info("  ResponseBound=%lld, Violations=%lld", v->latency_bound, v->latency_violations);
+                                                pr_info("  ResponseBound=%lld, Violations=%lld", v->response_bound, v->response_violations);
+                                                // Can reuse the logic from below
                                         }
                                         if (v->irq_handling_violations) {
-                                                pr_info("  IRQHandlingBound=%lld, Violations=%lld", v->latency_bound, v->latency_violations);
+                                                pr_info("  IRQHandlingBound=%lld, Violations=%lld\n", v->irq_handling_bound, v->irq_handling_violations);
+                                                pr_info("IRQ HANDLING VIOLATION TRACE: \n");
+
+                                                int len = READ_ONCE(v->max_i_trace_len);
+                                                for (int i = 0; i < len; i++) {
+                                                        struct slo_event event = v->max_irqt_violation_trace[i];
+                                                        if (event.type == SCHED_SWITCH) {
+                                                                pr_info("Event: sched_switch, preemption: %d, voluntary: %d, prev_pid: %d, next_pid: %d, on_cpu: %d\n",
+                                                                        event.event.switch_info.preempt,
+                                                                        event.event.switch_info.prev_state & (TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE | TASK_PARKED | TASK_IDLE | TASK_DEAD),
+                                                                        event.event.switch_info.prev_pid,
+                                                                        event.event.switch_info.next_pid,
+                                                                        event.event.switch_info.event_cpu);
+                                                        } else if (event.type == SCHED_WAKEUP) {
+                                                                pr_info("Event: sched_wakeup, pid: %d, wake_cpu: %d\n",
+                                                                        event.event.wakeup_info.pid,
+                                                                        event.event.wakeup_info.wake_cpu);
+                                                        } else if (event.type == SYS_SLEEP) {
+                                                                pr_info("Event: sys_sleep, pid: %d\n",
+                                                                        event.event.sleep_info.pid);
+                                                        } else if (event.type == IRQT_ENTRY) {
+                                                                pr_info("Event: irqt_entry, pid: %d\n",
+                                                                        event.event.irqt_entry_info.pid);
+                                                        } else if (event.type == IRQT_EXIT) {
+                                                                pr_info("Event: irqt_exit, pid: %d\n",
+                                                                        event.event.irqt_exit_info.pid);
+                                                        }
+                                                }
                                         }
                                 }
                                 else {
@@ -1095,9 +1206,6 @@ static void __exit rt_module_exit(void)
                                                                         event.event.sleep_info.pid);
                                                         }
                                                 }
-                                        }
-                                        if (v->irq_handling_violations) {
-                                                pr_info("  IRQHandlingBound=%lld, Violations=%lld\n", v->irq_handling_bound, v->irq_handling_violations);
                                         }
                                 }
                         }
