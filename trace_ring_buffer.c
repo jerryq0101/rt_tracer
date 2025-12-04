@@ -35,12 +35,12 @@ int slo_queue_push(struct slo_event ev)
         u64 head = event_queue.head_seq;
         // store a copy
         event_queue.buf[head % QUEUE_LEN] = ev;
-        event_queue.head_seq = (head++) % QUEUE_LEN;
+        event_queue.head_seq = head + 1;
 
         // Updating tail (if head caught up to tail)
         u64 tail = event_queue.tail_seq;
         if (head == tail) {
-                event_queue.tail_seq = (tail++) % QUEUE_LEN;
+                event_queue.tail_seq = tail + 1;
         }
         spin_unlock_irqrestore(&event_queue.lock, flags);
 

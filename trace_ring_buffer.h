@@ -10,8 +10,8 @@
 
 // Understand what prev_state is
 struct sched_switch_info {
-        char prev_name[TASK_COMM_LEN];
-        char next_name[TASK_COMM_LEN];
+        pid_t prev_pid;
+        pid_t next_pid;
         bool preempt;
         unsigned int prev_state;
         int event_cpu;
@@ -22,7 +22,7 @@ struct sched_switch_info {
 };
 
 struct sched_wakeup_info {
-        char name[TASK_COMM_LEN];
+        pid_t pid;
         int wake_cpu;
         int recent_used_cpu;
 
@@ -32,7 +32,7 @@ struct sched_wakeup_info {
 
 struct sys_sleep_info {
         // TODO: this name could be replaced with a pid
-        char name[TASK_COMM_LEN];
+        pid_t pid;
 };
 
 enum event_type {
@@ -44,10 +44,10 @@ enum event_type {
 struct slo_event {
         enum event_type type;
         union {
-                struct sched_switch_info;
-                struct sched_wakeup_info;
-                struct sys_sleep_info;
-        };
+                struct sched_switch_info switch_info;
+                struct sched_wakeup_info wakeup_info;
+                struct sys_sleep_info sleep_info;
+        } event;
 };
 
 struct event_ring {
