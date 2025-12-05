@@ -19,6 +19,9 @@ struct sched_switch_info {
         // Priorities
         int prev_prio;
         int next_prio;
+
+        // Time
+        s64 time;
 };
 
 struct sched_wakeup_info {
@@ -28,19 +31,31 @@ struct sched_wakeup_info {
 
         // General knowledge about the Task
         int prio;
+
+        // Time
+        s64 time;
 };
 
 struct sys_sleep_info {
         // TODO: this name could be replaced with a pid
         pid_t pid;
+        
+        // Time
+        s64 time;
 };
 
 struct irqt_entry_info {
         pid_t pid;
+        
+        // Time
+        s64 time;
 };
 
 struct irqt_exit_info {
         pid_t pid;
+
+        // Time
+        s64 time
 };
 
 enum event_type {

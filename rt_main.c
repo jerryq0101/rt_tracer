@@ -288,6 +288,7 @@ static void probe_sched_switch(void *data, bool preempt, struct task_struct *pre
         switch_event.event.switch_info.event_cpu = smp_processor_id();
         switch_event.event.switch_info.prev_prio = prev->prio;
         switch_event.event.switch_info.next_prio = next->prio;
+        switch_event.event.switch_info.time = ktime_get_ns();
         int switch_index = slo_queue_push(switch_event);
         
         // Track latency statistics for the next task switched into 
@@ -355,6 +356,7 @@ static void probe_sched_wakeup(void *data, struct task_struct *p)
         wakeup_event.event.wakeup_info.recent_used_cpu = p->recent_used_cpu;
         wakeup_event.event.wakeup_info.wake_cpu = smp_processor_id();
         wakeup_event.event.wakeup_info.pid = p->pid;
+        wakeup_event.event.wakeup_info.time = ktime_get_ns();
         int store_index = slo_queue_push(wakeup_event);
 
         struct task_latency_entry *e = slot_for(p->pid);
@@ -430,6 +432,7 @@ static void probe_sys_enter(void *data, struct pt_regs *regs, long id)
         struct slo_event sleep_event = { 0 };
         sleep_event.type = SYS_SLEEP;
         sleep_event.event.sleep_info.pid = e->pid;
+        sleep_event.event.sleep_info.time = ktime_get_ns();
         slo_queue_push(sleep_event);
 
         WRITE_ONCE(e->scause, SC_TIMER);
@@ -1114,6 +1117,7 @@ static void __exit rt_module_exit(void)
                                                         } else if (event.type == SCHED_WAKEUP) {
                                                                 pr_info("Event: sched_wakeup, pid: %d, wake_cpu: %d\n",
                                                                         event.event.wakeup_info.pid,
+                                                                        event.event.wakeup_info.prio,
                                                                         event.event.wakeup_info.wake_cpu);
                                                         } else if (event.type == SYS_SLEEP) {
                                                                 pr_info("Event: sys_sleep, pid: %d\n",
@@ -1143,19 +1147,26 @@ static void __exit rt_module_exit(void)
                                                 pr_info("LATENCY VIOLATION TRACE: \n");
 
                                                 int len = READ_ONCE(v->max_l_trace_len);
+                                                u64 base = v->max_l_violation_trace[0].event.wakeup_info.time;
                                                 for (int i = 0; i < len; i++) {
                                                         struct slo_event event = v->max_l_violation_trace[i];
                                                         if (event.type == SCHED_SWITCH) {
-                                                                pr_info("Event: sched_switch, prev_pid: %d, next_pid: %d, on_cpu: %d\n",
+                                                                u64 rel_us = div_u64(event.event.switch_info.time - base, 1000);
+                                                                pr_info("[%6llu us] Event: sched_switch, prev_pid: %d, next_pid: %d, on_cpu: %d\n",
+                                                                        rel_us,
                                                                         event.event.switch_info.prev_pid,
                                                                         event.event.switch_info.next_pid,
                                                                         event.event.switch_info.event_cpu);
                                                         } else if (event.type == SCHED_WAKEUP) {
-                                                                pr_info("Event: sched_wakeup, pid: %d, wake_cpu: %d\n",
+                                                                u64 rel_us = div_u64(event.event.wakeup_info.time - base, 1000);
+                                                                pr_info("[%6llu us] Event: sched_wakeup, pid: %d, wake_cpu: %d\n",
+                                                                        rel_us,
                                                                         event.event.wakeup_info.pid,
                                                                         event.event.wakeup_info.wake_cpu);
                                                         } else if (event.type == SYS_SLEEP) {
+                                                                u64 rel_us = div_u64(event.event.sleep_info.time - base, 1000);
                                                                 pr_info("Event: sys_sleep, pid: %d\n",
+                                                                        rel_us,
                                                                         event.event.sleep_info.pid);
                                                         }
                                                 }
@@ -1168,10 +1179,13 @@ static void __exit rt_module_exit(void)
                                                 for (int i = 0; i < len; i++) {
                                                         struct slo_event event = v->max_rt_violation_trace[i];
                                                         if (event.type == SCHED_SWITCH) {
-                                                                pr_info("Event: sched_switch, preemption: %d, prev_pid: %d, next_pid: %d, on_cpu: %d\n",
+                                                                pr_info("Event: sched_switch, preemption: %d, voluntary: %d, prev_pid: %d (priority: %d), next_pid: %d (priority: %d), on_cpu: %d, \n",
                                                                         event.event.switch_info.preempt,
+                                                                        event.event.switch_info.prev_state & (TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE | TASK_PARKED | TASK_IDLE | TASK_DEAD),
                                                                         event.event.switch_info.prev_pid,
+                                                                        event.event.switch_info.prev_prio,
                                                                         event.event.switch_info.next_pid,
+                                                                        event.event.switch_info.next_prio,
                                                                         event.event.switch_info.event_cpu);
                                                         } else if (event.type == SCHED_WAKEUP) {
                                                                 pr_info("Event: sched_wakeup, pid: %d, wake_cpu: %d\n",
@@ -1191,15 +1205,18 @@ static void __exit rt_module_exit(void)
                                                 for (int i = 0; i < len; i++) {
                                                         struct slo_event event = v->max_rtr_violation_trace[i];
                                                         if (event.type == SCHED_SWITCH) {
-                                                                pr_info("Event: sched_switch, preemption: %d, voluntary: %d, prev_pid: %d, next_pid: %d, on_cpu: %d\n",
+                                                                pr_info("Event: sched_switch, preemption: %d, voluntary: %d, prev_pid: %d (prio: %d), next_pid: %d (prio: %d), on_cpu: %d\n",
                                                                         event.event.switch_info.preempt,
                                                                         event.event.switch_info.prev_state & (TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE | TASK_PARKED | TASK_IDLE | TASK_DEAD),
                                                                         event.event.switch_info.prev_pid,
+                                                                        event.event.switch_info.prev_prio,
                                                                         event.event.switch_info.next_pid,
+                                                                        event.event.switch_info.next_prio,
                                                                         event.event.switch_info.event_cpu);
                                                         } else if (event.type == SCHED_WAKEUP) {
                                                                 pr_info("Event: sched_wakeup, pid: %d, wake_cpu: %d\n",
                                                                         event.event.wakeup_info.pid,
+                                                                        event.event.wakeup_info.prio,
                                                                         event.event.wakeup_info.wake_cpu);
                                                         } else if (event.type == SYS_SLEEP) {
                                                                 pr_info("Event: sys_sleep, pid: %d\n",

@@ -47,19 +47,3 @@ int slo_queue_push(struct slo_event ev)
         return head;
 }
 
-
-/**
- * fetch an array of slo events from beginning to end, relevant region. 
- * should not have removed any event in the fifo queue after this.
- * order of events is kept in resulting queue.
- * 
- * return 1 or 0 for success / fail.
- */
-// int slo_queue_fetch_sequence(struct slo_event **arr) 
-// {
-
-// }
-
-
-// TODO: for each violation, make filter for the logs for for things that are important to it.
-
