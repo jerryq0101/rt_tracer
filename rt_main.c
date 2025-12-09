@@ -110,7 +110,7 @@ struct task_latency_entry {
 };
 
 
-static void update_violation(enum stat_field field, s64 value, struct task_latency_entry *e, int violation_event_index);
+static void update_violation(enum stat_field field, s64 value, struct task_latency_entry *e);
 int collect_latency_violation_trace(struct task_latency_entry *e, int violation_event_index);
 int collect_response_violation_trace(struct task_latency_entry *entry, int violation_event_index);
 int collect_response_time_violation_trace(struct task_latency_entry *entry, int violation_event_index);
@@ -141,37 +141,50 @@ static inline struct task_latency_entry *slot_for(pid_t pid)
 Helper functions
 */
 
-#define UPDATE_MINMAX_FIELD(e, v, min_field, max_field)         \
-        do {                                                    \
-                s64 __cur_max = READ_ONCE((e)->max_field);      \
-                s64 __cur_min = READ_ONCE((e)->min_field);      \
-                if ((v) > __cur_max)                            \
-                        WRITE_ONCE((e)->max_field, (v));        \
-                if ((v) < __cur_min)                            \
-                        WRITE_ONCE((e)->min_field, (v));        \
-        } while (0)
-
+#define UPDATE_MINMAX_FIELD(e, v, min_field, max_field) ({      \
+        s64 __cur_max = READ_ONCE((e)->max_field);              \
+        s64 __cur_min = READ_ONCE((e)->min_field);              \
+        bool __updated = false;                                 \
+        if ((v) > __cur_max) {                                  \
+                WRITE_ONCE((e)->max_field, (v));                \
+                __updated = true;                               \
+        }                                                       \
+        if ((v) < __cur_min) {                                  \
+                WRITE_ONCE((e)->min_field, (v));                \
+                __updated = true;                               \
+        }                                                       \
+        __updated;                                              \
+})
 
 static __always_inline void update_minmax(enum stat_field choice,
                                           struct task_latency_entry *e,
-                                          s64 v)
+                                          s64 v,
+                                          int violation_event_index)
 {
         switch (choice) {
-        case LATENCY:
-                UPDATE_MINMAX_FIELD(e, v, latency_min_ns, latency_max_ns);
-                break;
-        case RESPONSE:
-                UPDATE_MINMAX_FIELD(e, v, rt_voluntary_min_ns, rt_voluntary_max_ns);
-                break;
-        case RESPONSE_RELIEF:
-                UPDATE_MINMAX_FIELD(e, v, rt_relief_min_ns, rt_relief_max_ns);
-                break;
-        case IRQ_HANDLING:
-                UPDATE_MINMAX_FIELD(e, v, irq_handle_min_ns, irq_handle_max_ns);
-                break;
-        default:
-                /* nothing */
-                break;
+                case LATENCY:
+                        if (UPDATE_MINMAX_FIELD(e, v, latency_min_ns, latency_max_ns)) {
+                                collect_latency_violation_trace(e, violation_event_index);
+                        }
+                        break;
+                case RESPONSE:
+                        if (UPDATE_MINMAX_FIELD(e, v, rt_voluntary_min_ns, rt_voluntary_max_ns)) {
+                                collect_response_violation_trace(e, violation_event_index);
+                        }
+                        break;
+                case RESPONSE_RELIEF:
+                        if (UPDATE_MINMAX_FIELD(e, v, rt_relief_min_ns, rt_relief_max_ns)) {
+                                collect_response_time_violation_trace(e, violation_event_index);
+                        }
+                        break;
+                case IRQ_HANDLING:
+                        if (UPDATE_MINMAX_FIELD(e, v, irq_handle_min_ns, irq_handle_max_ns)) {
+                                collect_irqt_violation_trace(e, violation_event_index);
+                        }
+                        break;
+                default:
+                        /* nothing */
+                        break;
         }
 }
 
@@ -300,8 +313,8 @@ static void probe_sched_switch(void *data, bool preempt, struct task_struct *pre
                 if (wu != 0) {
                         now = ktime_get_ns();
                         s64 delta = now - wu;
-                        update_minmax((enum stat_field) LATENCY, e, delta);
-                        update_violation((enum stat_field) LATENCY, delta, e, switch_index);
+                        update_minmax((enum stat_field) LATENCY, e, delta, switch_index);
+                        update_violation((enum stat_field) LATENCY, delta, e);
                         
                         // Write down the last wake up time used (this is for response time)
                         WRITE_ONCE(e->curr_wu_ns, wu);
@@ -327,16 +340,16 @@ static void probe_sched_switch(void *data, bool preempt, struct task_struct *pre
                         // Record the the voluntary sleep (any type)
                         if (wu) {
                                 s64 resp = now - wu;
-                                update_minmax((enum stat_field) RESPONSE, p, resp);
-                                update_violation((enum stat_field) RESPONSE, resp, p, switch_index);
+                                update_minmax((enum stat_field) RESPONSE, p, resp, switch_index);
+                                update_violation((enum stat_field) RESPONSE, resp, p);
                         }
 
                         if (vol_sleep_cause == SC_TIMER && READ_ONCE(p->cycle_active)) {
                                 s64 cs = xchg(&p->cycle_start_ns, 0);
                                 if (cs) {
                                         s64 cycle = now - cs;
-                                        update_minmax((enum stat_field) RESPONSE_RELIEF, p, cycle);
-                                        update_violation((enum stat_field) RESPONSE_RELIEF, cycle, p, switch_index);
+                                        update_minmax((enum stat_field) RESPONSE_RELIEF, p, cycle, switch_index);
+                                        update_violation((enum stat_field) RESPONSE_RELIEF, cycle, p);
                                 }
                                 WRITE_ONCE(p->cycle_active, false);
                         }
@@ -484,8 +497,8 @@ static void probe_irq_threaded_handler_exit(void *data, int irq, struct irqactio
                         s64 le = xchg(&e->last_handler_call_entry, 0);
                         if (le != 0) {
                                 s64 delta = ktime_get_ns() - le;
-                                update_minmax((enum stat_field) IRQ_HANDLING, e, delta);
-                                update_violation((enum stat_field) IRQ_HANDLING, delta, e, switch_index);
+                                update_minmax((enum stat_field) IRQ_HANDLING, e, delta, switch_index);
+                                update_violation((enum stat_field) IRQ_HANDLING, delta, e);
                         }
                 }
         }
@@ -500,7 +513,7 @@ static void probe_irq_threaded_handler_exit(void *data, int irq, struct irqactio
  * violation_event_index points to the event that completed this SLO. 
  * 
  */
-static void update_violation(enum stat_field field, s64 value, struct task_latency_entry *e, int violation_event_index) {
+static void update_violation(enum stat_field field, s64 value, struct task_latency_entry *e) {
         s64 bound;
         switch (field) {
                 case LATENCY:
@@ -510,29 +523,24 @@ static void update_violation(enum stat_field field, s64 value, struct task_laten
                         bound = READ_ONCE(e->v.latency_bound);
                         if (value > bound) {
                                 WRITE_ONCE(e->v.latency_violations, READ_ONCE(e->v.latency_violations) + 1);
-                                // pr_info("Collect latency violation trace!\n");
-                                collect_latency_violation_trace(e, violation_event_index);
                         }
                         break;
                 case RESPONSE:
                         bound = READ_ONCE(e->v.response_bound);
                         if (value > bound) {
                                 WRITE_ONCE(e->v.response_violations, READ_ONCE(e->v.response_violations) + 1);
-                                collect_response_violation_trace(e, violation_event_index);
                         }
                         break;
                 case RESPONSE_RELIEF:
                         bound = READ_ONCE(e->v.response_relief_bound);
                         if (value > bound) {
                                 WRITE_ONCE(e->v.response_relief_violations, READ_ONCE(e->v.response_relief_violations) + 1);
-                                collect_response_time_violation_trace(e, violation_event_index);
                         }
                         break;
                 case IRQ_HANDLING:
                         bound = READ_ONCE(e->v.irq_handling_bound);
                         if (value > bound) {
                                 WRITE_ONCE(e->v.irq_handling_violations, READ_ONCE(e->v.irq_handling_violations) + 1);
-                                collect_irqt_violation_trace(e, violation_event_index);
                         }
                         break;
                 default:
@@ -1144,7 +1152,7 @@ static void __exit rt_module_exit(void)
                                         struct task_stat_slo *v = &curr->v;
                                         if (v->latency_violations) {
                                                 pr_info("  LatencyBound=%lld, Violations=%lld\n", v->latency_bound, v->latency_violations);
-                                                pr_info("LATENCY VIOLATION TRACE: \n");
+                                                pr_info("WORST LATENCY TRACE: \n");
 
                                                 int len = READ_ONCE(v->max_l_trace_len);
                                                 u64 base = v->max_l_violation_trace[0].event.wakeup_info.time;
@@ -1152,14 +1160,14 @@ static void __exit rt_module_exit(void)
                                                         struct slo_event event = v->max_l_violation_trace[i];
                                                         if (event.type == SCHED_SWITCH) {
                                                                 u64 rel_us = div_u64(event.event.switch_info.time - base, 1000);
-                                                                pr_info("[%6llu us] Event: sched_switch, prev_pid: %d, next_pid: %d, on_cpu: %d\n",
+                                                                pr_info("[%6llu µs] Event: sched_switch, prev_pid: %d, next_pid: %d, on_cpu: %d\n",
                                                                         rel_us,
                                                                         event.event.switch_info.prev_pid,
                                                                         event.event.switch_info.next_pid,
                                                                         event.event.switch_info.event_cpu);
                                                         } else if (event.type == SCHED_WAKEUP) {
                                                                 u64 rel_us = div_u64(event.event.wakeup_info.time - base, 1000);
-                                                                pr_info("[%6llu us] Event: sched_wakeup, pid: %d, wake_cpu: %d\n",
+                                                                pr_info("[%6llu µs] Event: sched_wakeup, pid: %d, wake_cpu: %d\n",
                                                                         rel_us,
                                                                         event.event.wakeup_info.pid,
                                                                         event.event.wakeup_info.wake_cpu);
