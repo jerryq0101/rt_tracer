@@ -19,6 +19,8 @@
 #define MAX_TRACED_PIDS 10
 #define MAX_TRACE_LEN_PER_SLO 10
 
+#define START_INVALID -1
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Jerry Qi");
 MODULE_DESCRIPTION("A Simple Kernel Module to track latency");
@@ -704,9 +706,16 @@ static void update_violation(enum stat_field field, s64 value, struct task_laten
  * PRECONDITION: pid is an active element 
  */
 int collect_latency_violation_trace(struct task_latency_entry *entry, int violation_event_index) {
+        // Restrict max_l_start_index to only be consumed once
+        // TODO: implement this only consume once on other trace functions
+        int start_index = xchg(&entry->v.max_l_start_index, START_INVALID);
+        if (start_index == START_INVALID) {
+                return -1;
+        }
+
         return collect_slo_trace_common(
                 entry,
-                READ_ONCE(entry->v.max_l_start_index),
+                start_index,
                 violation_event_index,
                 entry->v.max_l_violation_trace,
                 &entry->v.max_l_trace_len,
@@ -778,7 +787,6 @@ static int collect_slo_trace_common(struct task_latency_entry *e,
                         dst[len] = *se;
                         len = len + 1;
                 }
-
         }
         spin_unlock_irqrestore(&event_queue.lock, flags);
         *dst_len = len;
@@ -826,6 +834,8 @@ static bool should_include_event(enum slo_trace_mode mode, struct slo_event *se,
                                 }
                         }
                         return false;
+                default:
+                        break;
         }
         return false;
 }
