@@ -322,19 +322,19 @@ static void stop_recording_pid(pid_t pid)
                 
                 struct task_stat_slo *v = &e->v;
                 // then print out the violation traces
-                if (v->latency_violations) {
+                if (v->latency_bound) {
                         pr_info("  LatencyBound=%lld, Violations=%lld\n", v->latency_bound, v->latency_violations);
                         print_single_trace(e, &e->v, e->v.max_l_violation_trace, e->v.max_l_trace_len, LATENCY);
                 }
-                if (v->response_violations) {
+                if (v->response_bound) {
                         pr_info("  ResponseBound=%lld, Violations=%lld\n", v->response_bound, v->response_violations);
                         print_single_trace(e, &e->v, e->v.max_rt_violation_trace, e->v.max_r_trace_len, RESPONSE);
                 }
-                if (v->response_relief_violations) {
+                if (v->response_relief_bound) {
                         pr_info("  ResponseReliefBound=%lld, Violations=%lld\n", v->response_relief_bound, v->response_relief_violations);
                         print_single_trace(e, &e->v, e->v.max_rtr_violation_trace, e->v.max_rr_trace_len, RESPONSE_RELIEF);
                 }
-                if (v->irq_handling_violations && is_irq) {
+                if (v->irq_handling_bound && is_irq) {
                         pr_info("  IRQHandlingBound=%lld, Violations=%lld\n", v->irq_handling_bound, v->irq_handling_violations);
                         print_single_trace(e, &e->v, e->v.max_irqt_violation_trace, e->v.max_i_trace_len, IRQ_HANDLING);
                 }
@@ -466,7 +466,7 @@ static void probe_sched_switch(void *data, bool preempt, struct task_struct *pre
         if (p && smp_load_acquire(&p->active)) {
                 // Indicates a voluntary exit
                 bool voluntary = prev_state & (TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE | TASK_PARKED | TASK_IDLE | TASK_DEAD);
-                
+
                 if (voluntary) {
                         s64 now = ktime_get_ns();
                         enum sleep_cause vol_sleep_cause = READ_ONCE(p->scause);
