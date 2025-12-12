@@ -137,7 +137,6 @@ static void set_##name(pid_t pid, s64 value) { \
         } \
 }
 
-
 static struct task_latency_entry *pidtab;
 
 static inline struct task_latency_entry *slot_for(pid_t pid)
@@ -211,7 +210,6 @@ static int start_recording_pid(pid_t pid, bool traced)
                 return -EINVAL;
         }
 
-        // Mark inactive first to allow us to reinitialize handlers
         WRITE_ONCE(e->active, false);
 
         // Reinit stats
@@ -245,22 +243,19 @@ static int start_recording_pid(pid_t pid, bool traced)
         /* Latency */
         WRITE_ONCE(e->v.max_l_start_index, 0);
         WRITE_ONCE(e->v.max_l_trace_len, 0);
-
         /* Response (voluntary sleep) */
         WRITE_ONCE(e->v.max_r_start_index, 0);
         WRITE_ONCE(e->v.max_r_trace_len, 0);
-
         /* Response relief */
         WRITE_ONCE(e->v.max_rr_start_index, 0);
         WRITE_ONCE(e->v.max_rr_trace_len, 0);
-
         /* IRQ handling */
         WRITE_ONCE(e->v.max_i_start_index, 0);
         WRITE_ONCE(e->v.max_i_trace_len, 0);
         // TODO: make sure other variables in the recording and default structus are initialized correctly
 
         // Allocate if trace is enabled
-        if (READ_ONCE(e->trace_enabled) == true) {
+        if (traced) {
                 struct slo_event *latencyslo = kzalloc(MAX_TRACE_LEN_PER_SLO * sizeof(struct slo_event), GFP_KERNEL);
                 struct slo_event *rtslo = kzalloc(MAX_TRACE_LEN_PER_SLO * sizeof(struct slo_event), GFP_KERNEL);
                 struct slo_event *rt_reliefslo = kzalloc(MAX_TRACE_LEN_PER_SLO * sizeof(struct slo_event), GFP_KERNEL);
@@ -299,9 +294,6 @@ static void stop_recording_pid(pid_t pid)
 
         // to prevent double stop (e.g. rmmod and program exit happens at the same time)
         if (xchg(&e->active, false)) {
-                // make this false to prevent tracepoints from firing again and storing bs data
-                smp_store_release(&e->active, false);
-
                 // print some base statistics 
                         // special case for IRQs
                 bool is_irq = false;
@@ -339,7 +331,7 @@ static void stop_recording_pid(pid_t pid)
                         print_single_trace(e, &e->v, e->v.max_irqt_violation_trace, e->v.max_i_trace_len, IRQ_HANDLING);
                 }
 
-                if (READ_ONCE(e->trace_enabled) == true) {
+                if (xchg(&e->trace_enabled, false)) {
                         void *latencyslo = READ_ONCE(e->v.max_l_violation_trace);
                         void *rtslo = READ_ONCE(e->v.max_rt_violation_trace);
                         void *rt_reliefslo = READ_ONCE(e->v.max_rtr_violation_trace);
@@ -349,8 +341,6 @@ static void stop_recording_pid(pid_t pid)
                         kfree(rtslo);
                         kfree(rt_reliefslo);
                         kfree(irqtslo);
-                        
-                        WRITE_ONCE(e->trace_enabled, false);
                 }
         }
 }
@@ -881,12 +871,10 @@ static ssize_t add_pid_store(struct kobject *kobj,
         if (n == 1)             // No trace
         {
                 start_recording_pid(pid, false);
-                // pr_info("Added pid %d, no trace\n", pid);
         } else if (n == 2)      // Yes trace
         {
-                if (!strcmp(cmd, "trace")) {
+                if (strcmp(cmd, "trace") == 0) {
                         start_recording_pid(pid, true);
-                        // pr_info("Added pid %d, with trace\n", pid);
                 }
                 else {
                         pr_warn("Unknown command: %s\n", cmd);
@@ -1176,7 +1164,7 @@ static void __exit rt_module_exit(void)
         if (pidtab) {
                 for (int i = 0; i < PIDTAB_SIZE; i++) {
                         struct task_latency_entry *curr = slot_for(i);
-                        if (smp_load_acquire(&curr->active)) {
+                        if (xchg(&curr->active, false)) {
                                 stop_recording_pid(i);
                         }
                 }
