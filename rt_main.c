@@ -29,6 +29,7 @@ static struct tracepoint *tp_sched_wakeup;
 static struct tracepoint *tp_sys_enter;
 static struct tracepoint *tp_irq_threaded_handler_entry;
 static struct tracepoint *tp_irq_threaded_handler_exit;
+static struct tracepoint *tp_sched_process_exit;
 
 enum stat_field {
         LATENCY,
@@ -151,7 +152,6 @@ Helper functions
         }                                                       \
         if ((v) < __cur_min) {                                  \
                 WRITE_ONCE((e)->min_field, (v));                \
-                __updated = true;                               \
         }                                                       \
         __updated;                                              \
 })
@@ -260,6 +260,9 @@ static int start_recording_pid(pid_t pid, bool traced)
 }
 
 
+/*
+This should be called for every program on exit to clean up.
+*/
 static void stop_recording_pid(pid_t pid)
 {
         struct task_latency_entry *e = slot_for(pid);
@@ -267,22 +270,185 @@ static void stop_recording_pid(pid_t pid)
                 return;
         }
 
-        if (READ_ONCE(e->trace_enabled) == true) {
-                void *latencyslo = READ_ONCE(e->v.max_l_violation_trace);
-                void *rtslo = READ_ONCE(e->v.max_rt_violation_trace);
-                void *rt_reliefslo = READ_ONCE(e->v.max_rtr_violation_trace);
-                void *irqtslo = READ_ONCE(e->v.max_irqt_violation_trace);
+        // to prevent double stop (e.g. rmmod and program exit happens at the same time)
+        if (xchg(&e->active, false)) {
+                // make this false to prevent tracepoints from firing again and storing bs data
+                smp_store_release(&e->active, false);
 
-                kfree(latencyslo);
-                kfree(rtslo);
-                kfree(rt_reliefslo);
-                kfree(irqtslo);
+                // print some base statistics 
+                        // special case for IRQs
+                bool is_irq = false;
+                if (strncmp(e->comm, "irq/", 4) == 0) {
+                        is_irq = true;
+                        pr_info("IRQ %s (PID=%d):\n", e->comm, pid);
+                        pr_info("  service_time_min/max (wake->first sleep): %lld / %lld ns\n", e->rt_voluntary_min_ns, e->rt_voluntary_max_ns);
+                        pr_info("  latency_min/max (wake->first run): %lld / %lld ns\n", e->latency_min_ns, e->latency_max_ns);
+                        pr_info("  per interrupt bottom half handling time (single iteration): %lld / %lld ns\n", e->irq_handle_min_ns, e->irq_handle_max_ns);
+                }
+                else {
+                        pr_info("jerry_rt_module: PID=%d, Name=%s, minLat=%lli, maxLat=%lli,\nminResponseTimeVoluntarySleepAllTypes=%lli, maxResponseTimeVoluntarySleepAllTypes=%lli, \nminResponseTimeVoluntarySleepReliefBased=%lli, maxResponseTimeVoluntarySleepReliefBased=%lli", 
+                                pid, e->comm, READ_ONCE(e->latency_min_ns), 
+                                READ_ONCE(e->latency_max_ns), 
+                                READ_ONCE(e->rt_voluntary_min_ns), READ_ONCE(e->rt_voluntary_max_ns), 
+                                READ_ONCE(e->rt_relief_min_ns), READ_ONCE(e->rt_relief_max_ns));
+                }
+                
+                struct task_stat_slo *v = &e->v;
+                // then print out the violation traces
+                if (v->latency_violations) {
+                        pr_info("  LatencyBound=%lld, Violations=%lld\n", v->latency_bound, v->latency_violations);
+                        pr_info("WORST LATENCY TRACE: \n");
+                        
+                        if (e->trace_enabled) {
+                                int len = READ_ONCE(v->max_l_trace_len);
+                                // TODO, if this hasn't been allocated it could be bad accessing invalid memory
+                                u64 base = v->max_l_violation_trace[0].event.wakeup_info.time;
+        
+                                for (int i = 0; i < len; i++) {
+                                        struct slo_event event = v->max_l_violation_trace[i];
+                                        if (event.type == SCHED_SWITCH) {
+                                                u64 rel_us = div_u64(event.event.switch_info.time - base, 1000);
+                                                pr_info("[%6llu µs] Event: sched_switch, prev_pid: %d, next_pid: %d, on_cpu: %d\n",
+                                                        rel_us,
+                                                        event.event.switch_info.prev_pid,
+                                                        event.event.switch_info.next_pid,
+                                                        event.event.switch_info.event_cpu);
+                                        } else if (event.type == SCHED_WAKEUP) {
+                                                u64 rel_us = div_u64(event.event.wakeup_info.time - base, 1000);
+                                                pr_info("[%6llu µs] Event: sched_wakeup, pid: %d, wake_cpu: %d\n",
+                                                        rel_us,
+                                                        event.event.wakeup_info.pid,
+                                                        event.event.wakeup_info.wake_cpu);
+                                        } else if (event.type == SYS_SLEEP) {
+                                                u64 rel_us = div_u64(event.event.sleep_info.time - base, 1000);
+                                                pr_info("[%6llu µs] Event: sys_sleep, pid: %d\n",
+                                                        rel_us,
+                                                        event.event.sleep_info.pid);
+                                        }
+                                }
+                        }
+                }
+                if (v->response_violations) {
+                        pr_info("  ResponseBound=%lld, Violations=%lld\n", v->response_bound, v->response_violations);
+                        pr_info("RESPONSE TIME VIOLATION TRACE: \n");
+
+                        if (e->trace_enabled) {
+                                int len = READ_ONCE(v->max_r_trace_len);
+                                // TODO, if this hasn't been allocated it could be bad accessing invalid memory
+                                u64 base = v->max_rt_violation_trace[0].event.wakeup_info.time;
+        
+                                for (int i = 0; i < len; i++) {
+                                        struct slo_event event = v->max_rt_violation_trace[i];
+                                        if (event.type == SCHED_SWITCH) {
+                                                u64 rel_us = div_u64(event.event.switch_info.time - base, 1000);
+        
+                                                pr_info("[%6llu µs] Event: sched_switch, preemption: %d, voluntary: %d, prev_pid: %d (priority: %d), next_pid: %d (priority: %d), on_cpu: %d, \n",
+                                                        rel_us,
+                                                        event.event.switch_info.preempt,
+                                                        event.event.switch_info.prev_state & (TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE | TASK_PARKED | TASK_IDLE | TASK_DEAD),
+                                                        event.event.switch_info.prev_pid,
+                                                        event.event.switch_info.prev_prio,
+                                                        event.event.switch_info.next_pid,
+                                                        event.event.switch_info.next_prio,
+                                                        event.event.switch_info.event_cpu);
+                                        } else if (event.type == SCHED_WAKEUP) {
+                                                u64 rel_us = div_u64(event.event.wakeup_info.time - base, 1000);
+        
+                                                pr_info("[%6llu µs] Event: sched_wakeup, pid: %d, wake_cpu: %d\n",
+                                                        rel_us,
+                                                        event.event.wakeup_info.pid,
+                                                        event.event.wakeup_info.wake_cpu);
+                                        } else if (event.type == SYS_SLEEP) {
+                                                u64 rel_us = div_u64(event.event.sleep_info.time - base, 1000);
+        
+                                                pr_info("[%6llu µs] Event: sys_sleep, pid: %d\n",
+                                                        rel_us,
+                                                        event.event.sleep_info.pid);
+                                        }
+                                }
+                        }
+                }
+                if (v->response_relief_violations) {
+                        pr_info("  ResponseReliefBound=%lld, Violations=%lld\n", v->response_relief_bound, v->response_relief_violations);
+                        pr_info("RESPONSE TIME RELIEF VIOLATION TRACE: \n");
+
+                        if (e->trace_enabled) {
+                                int len = READ_ONCE(v->max_rr_trace_len);
+        
+                                for (int i = 0; i < len; i++) {
+                                        struct slo_event event = v->max_rtr_violation_trace[i];
+                                        if (event.type == SCHED_SWITCH) {
+                                                pr_info("Event: sched_switch, preemption: %d, voluntary: %d, prev_pid: %d (prio: %d), next_pid: %d (prio: %d), on_cpu: %d\n",
+                                                        event.event.switch_info.preempt,
+                                                        event.event.switch_info.prev_state & (TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE | TASK_PARKED | TASK_IDLE | TASK_DEAD),
+                                                        event.event.switch_info.prev_pid,
+                                                        event.event.switch_info.prev_prio,
+                                                        event.event.switch_info.next_pid,
+                                                        event.event.switch_info.next_prio,
+                                                        event.event.switch_info.event_cpu);
+                                        } else if (event.type == SCHED_WAKEUP) {
+                                                pr_info("Event: sched_wakeup, pid: %d, wake_cpu: %d\n",
+                                                        event.event.wakeup_info.pid,
+                                                        event.event.wakeup_info.prio,
+                                                        event.event.wakeup_info.wake_cpu);
+                                        } else if (event.type == SYS_SLEEP) {
+                                                pr_info("Event: sys_sleep, pid: %d\n",
+                                                        event.event.sleep_info.pid);
+                                        }
+                                }
+                        }
+                }
+
+                if (v->irq_handling_violations && is_irq) {
+                        pr_info("  IRQHandlingBound=%lld, Violations=%lld\n", v->irq_handling_bound, v->irq_handling_violations);
+                        pr_info("IRQ HANDLING VIOLATION TRACE: \n");
+
+                        if (e->trace_enabled) {
+                                int len = READ_ONCE(v->max_i_trace_len);
+                                for (int i = 0; i < len; i++) {
+                                        struct slo_event event = v->max_irqt_violation_trace[i];
+                                        if (event.type == SCHED_SWITCH) {
+                                                pr_info("Event: sched_switch, preemption: %d, voluntary: %d, prev_pid: %d, next_pid: %d, on_cpu: %d\n",
+                                                        event.event.switch_info.preempt,
+                                                        event.event.switch_info.prev_state & (TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE | TASK_PARKED | TASK_IDLE | TASK_DEAD),
+                                                        event.event.switch_info.prev_pid,
+                                                        event.event.switch_info.next_pid,
+                                                        event.event.switch_info.event_cpu);
+                                        } else if (event.type == SCHED_WAKEUP) {
+                                                pr_info("Event: sched_wakeup, pid: %d, wake_cpu: %d\n",
+                                                        event.event.wakeup_info.pid,
+                                                        event.event.wakeup_info.prio,
+                                                        event.event.wakeup_info.wake_cpu);
+                                        } else if (event.type == SYS_SLEEP) {
+                                                pr_info("Event: sys_sleep, pid: %d\n",
+                                                        event.event.sleep_info.pid);
+                                        } else if (event.type == IRQT_ENTRY) {
+                                                pr_info("Event: irqt_entry, pid: %d\n",
+                                                        event.event.irqt_entry_info.pid);
+                                        } else if (event.type == IRQT_EXIT) {
+                                                pr_info("Event: irqt_exit, pid: %d\n",
+                                                        event.event.irqt_exit_info.pid);
+                                        }
+                                }
+                        }
+
+                }
+
+                if (READ_ONCE(e->trace_enabled) == true) {
+                        void *latencyslo = READ_ONCE(e->v.max_l_violation_trace);
+                        void *rtslo = READ_ONCE(e->v.max_rt_violation_trace);
+                        void *rt_reliefslo = READ_ONCE(e->v.max_rtr_violation_trace);
+                        void *irqtslo = READ_ONCE(e->v.max_irqt_violation_trace);
+
+                        kfree(latencyslo);
+                        kfree(rtslo);
+                        kfree(rt_reliefslo);
+                        kfree(irqtslo);
+                        
+                        WRITE_ONCE(e->trace_enabled, false);
+                }
         }
-
-        // For visibility when the tracepoint is fired immediately after.
-        smp_store_release(&e->active, false);
 }
-
 
 /*
 Function that would be called whn sched_switched happens
@@ -505,6 +671,19 @@ static void probe_irq_threaded_handler_exit(void *data, int irq, struct irqactio
 }
 
 
+/*
+Handler for process natural exit
+*/
+static void probe_sched_process_exit(void *data, struct task_struct *p)
+{
+        pid_t pid = p->pid;
+        struct task_latency_entry *e = slot_for(pid);
+
+        if (!e || !smp_load_acquire(&e->active)) {
+                return;
+        }
+        stop_recording_pid(pid);
+}
 
 /**
  * Function to update violation status for a particular field
@@ -561,13 +740,11 @@ int collect_latency_violation_trace(struct task_latency_entry *e, int violation_
         if (READ_ONCE(e->trace_enabled)) {
                 unsigned int flags;
                 spin_lock_irqsave(&event_queue.lock, flags);
-                // u64 head = event_queue.head_seq;
                 u64 tail = event_queue.tail_seq;
                 u64 index = e->v.max_l_start_index;
                 if (tail > index)       // Tail has already went past our element
                 {
                         // We won't record this because trace is broken
-                        // pr_info("max_l_index got polluted?\n");
                         spin_unlock_irqrestore(&event_queue.lock, flags);
                         return -1;
                 }
@@ -578,11 +755,6 @@ int collect_latency_violation_trace(struct task_latency_entry *e, int violation_
                 for (int i = index; i <= violation_event_index && len < MAX_TRACE_LEN_PER_SLO; i++, len++) {
                         struct slo_event *se = &event_queue.buf[i % QUEUE_LEN];
                         arr[len] = *se;
-                        // if satisfied the ending condition of latency
-                        // if (se->type == SCHED_SWITCH && se->event.switch_info.next_pid == e->pid)
-                        // {
-                        //         break;
-                        // }
                 }
                 WRITE_ONCE(e->v.max_l_trace_len, len);
                 spin_unlock_irqrestore(&event_queue.lock, flags);
@@ -591,7 +763,7 @@ int collect_latency_violation_trace(struct task_latency_entry *e, int violation_
         return 0;
 }
 
-// DRY - probably implement a selector within the trace collecting loop (what particular to include?)
+// TODO DRY - probably implement a selector within the trace collecting loop (what particular to include?)
 int collect_response_violation_trace(struct task_latency_entry *entry, int violation_event_index) {
         if (READ_ONCE(entry->trace_enabled))
         {
@@ -652,7 +824,7 @@ int collect_response_violation_trace(struct task_latency_entry *entry, int viola
         return 0;
 }
 
-// DRY
+// TODO DRY
 int collect_response_time_violation_trace(struct task_latency_entry *entry, int violation_event_index) {
         if (READ_ONCE(entry->trace_enabled))
         {
@@ -710,7 +882,7 @@ int collect_response_time_violation_trace(struct task_latency_entry *entry, int 
         return 0;
 }
 
-// DRY!!!!
+// TODO DRY!!!!
 int collect_irqt_violation_trace(struct task_latency_entry *entry, int violation_event_index) {
         if (READ_ONCE(entry->trace_enabled))
         {
@@ -793,6 +965,8 @@ static void find_tp(struct tracepoint *tp, void *priv)
                 tp_irq_threaded_handler_entry = tp;
         } else if (strcmp(tp->name, "irq_threaded_handler_exit") == 0) {
                 tp_irq_threaded_handler_exit = tp;
+        } else if (strcmp(tp->name, "sched_process_exit") == 0) {
+                tp_sched_process_exit = tp;
         }
 }
 
@@ -994,12 +1168,17 @@ static int __init rt_module_init(void)
                 return -ENOENT;
         }
         if (!tp_irq_threaded_handler_entry) {
-                pr_err("jerry_rt_module: We don't have tp_irq_threaded_handler_entry tracepoint\n");
+                pr_err("jerry_rt_module: We don't have irq_threaded_handler_entry tracepoint\n");
                 vfree(pidtab);
                 return -ENOENT;
         }
         if (!tp_irq_threaded_handler_exit) {
-                pr_err("jerry_rt_module: We don't have tp_irq_threaded_handler_exit tracepoint\n");
+                pr_err("jerry_rt_module: We don't have irq_threaded_handler_exit tracepoint\n");
+                vfree(pidtab);
+                return -ENOENT;
+        }
+        if (!tp_sched_process_exit) {
+                pr_err("jerry_rt_module: We don't have sched_process_exit tracepoint\n");
                 vfree(pidtab);
                 return -ENOENT;
         }
@@ -1045,6 +1224,17 @@ static int __init rt_module_init(void)
                 vfree(pidtab);
                 return -EINVAL;
         }
+        
+        if (tracepoint_probe_register(tp_sched_process_exit, probe_sched_process_exit, NULL)) {
+                pr_err("jerry_rt_module: Failed to register sched_process_exit probe\n");
+                tracepoint_probe_unregister(tp_sched_switch, probe_sched_switch, NULL);
+                tracepoint_probe_unregister(tp_sched_wakeup, probe_sched_wakeup, NULL);
+                tracepoint_probe_unregister(tp_sys_enter, probe_sys_enter, NULL);
+                tracepoint_probe_unregister(tp_irq_threaded_handler_entry, probe_irq_threaded_handler_entry, NULL);
+                tracepoint_probe_unregister(tp_irq_threaded_handler_exit, probe_irq_threaded_handler_exit, NULL);
+                vfree(pidtab);
+                return -EINVAL;
+        }
 
         // Creating the SLO queue
         int ret = slo_queue_init();
@@ -1085,6 +1275,9 @@ static void __exit rt_module_exit(void)
         if (tp_irq_threaded_handler_exit) {
                 tracepoint_probe_unregister(tp_irq_threaded_handler_exit, probe_irq_threaded_handler_exit, NULL);
         }
+        if (tp_sched_process_exit) {
+                tracepoint_probe_unregister(tp_sched_process_exit, probe_sched_process_exit, NULL);
+        }
 
         // Wait so that probe function is not still running on other cores
         tracepoint_synchronize_unregister();
@@ -1092,147 +1285,8 @@ static void __exit rt_module_exit(void)
         if (pidtab) {
                 for (int i = 0; i < PIDTAB_SIZE; i++) {
                         struct task_latency_entry *curr = slot_for(i);
-                        if (smp_load_acquire(&curr->active) == true) {
-                                if (strncmp(curr->comm, "irq/", 4) == 0) {
-                                        pr_info("IRQ %s (PID=%d):\n", curr->comm, i);
-                                        pr_info("  service_time_min/max (wake->first sleep): %lld / %lld ns\n", curr->rt_voluntary_min_ns, curr->rt_voluntary_max_ns);
-                                        pr_info("  latency_min/max (wake->first run): %lld / %lld ns\n", curr->latency_min_ns, curr->latency_max_ns);
-                                        pr_info("  per interrupt bottom half handling time (single iteration): %lld / %lld ns\n", curr->irq_handle_min_ns, curr->irq_handle_max_ns);
-
-                                        struct task_stat_slo *v = &curr->v;
-                                        if (v->latency_violations) {
-                                                pr_info("  LatencyBound=%lld, Violations=%lld", v->latency_bound, v->latency_violations);
-                                                // Can probably reuse the logic from below
-                                        }
-                                        if (v->response_violations) {
-                                                pr_info("  ResponseBound=%lld, Violations=%lld", v->response_bound, v->response_violations);
-                                                // Can reuse the logic from below
-                                        }
-                                        if (v->irq_handling_violations) {
-                                                pr_info("  IRQHandlingBound=%lld, Violations=%lld\n", v->irq_handling_bound, v->irq_handling_violations);
-                                                pr_info("IRQ HANDLING VIOLATION TRACE: \n");
-
-                                                int len = READ_ONCE(v->max_i_trace_len);
-                                                for (int i = 0; i < len; i++) {
-                                                        struct slo_event event = v->max_irqt_violation_trace[i];
-                                                        if (event.type == SCHED_SWITCH) {
-                                                                pr_info("Event: sched_switch, preemption: %d, voluntary: %d, prev_pid: %d, next_pid: %d, on_cpu: %d\n",
-                                                                        event.event.switch_info.preempt,
-                                                                        event.event.switch_info.prev_state & (TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE | TASK_PARKED | TASK_IDLE | TASK_DEAD),
-                                                                        event.event.switch_info.prev_pid,
-                                                                        event.event.switch_info.next_pid,
-                                                                        event.event.switch_info.event_cpu);
-                                                        } else if (event.type == SCHED_WAKEUP) {
-                                                                pr_info("Event: sched_wakeup, pid: %d, wake_cpu: %d\n",
-                                                                        event.event.wakeup_info.pid,
-                                                                        event.event.wakeup_info.prio,
-                                                                        event.event.wakeup_info.wake_cpu);
-                                                        } else if (event.type == SYS_SLEEP) {
-                                                                pr_info("Event: sys_sleep, pid: %d\n",
-                                                                        event.event.sleep_info.pid);
-                                                        } else if (event.type == IRQT_ENTRY) {
-                                                                pr_info("Event: irqt_entry, pid: %d\n",
-                                                                        event.event.irqt_entry_info.pid);
-                                                        } else if (event.type == IRQT_EXIT) {
-                                                                pr_info("Event: irqt_exit, pid: %d\n",
-                                                                        event.event.irqt_exit_info.pid);
-                                                        }
-                                                }
-                                        }
-                                }
-                                else {
-                                        pr_info(
-                                                "jerry_rt_module: PID=%d, Name=%s, minLat=%lli, maxLat=%lli,\nminResponseTimeVoluntarySleepAllTypes=%lli, maxResponseTimeVoluntarySleepAllTypes=%lli, \nminResponseTimeVoluntarySleepReliefBased=%lli, maxResponseTimeVoluntarySleepReliefBased=%lli", 
-                                                i, curr->comm, READ_ONCE(curr->latency_min_ns), 
-                                                READ_ONCE(curr->latency_max_ns), 
-                                                READ_ONCE(curr->rt_voluntary_min_ns), READ_ONCE(curr->rt_voluntary_max_ns), 
-                                                READ_ONCE(curr->rt_relief_min_ns), READ_ONCE(curr->rt_relief_max_ns)
-                                        );
-
-                                        struct task_stat_slo *v = &curr->v;
-                                        if (v->latency_violations) {
-                                                pr_info("  LatencyBound=%lld, Violations=%lld\n", v->latency_bound, v->latency_violations);
-                                                pr_info("WORST LATENCY TRACE: \n");
-
-                                                int len = READ_ONCE(v->max_l_trace_len);
-                                                u64 base = v->max_l_violation_trace[0].event.wakeup_info.time;
-                                                for (int i = 0; i < len; i++) {
-                                                        struct slo_event event = v->max_l_violation_trace[i];
-                                                        if (event.type == SCHED_SWITCH) {
-                                                                u64 rel_us = div_u64(event.event.switch_info.time - base, 1000);
-                                                                pr_info("[%6llu µs] Event: sched_switch, prev_pid: %d, next_pid: %d, on_cpu: %d\n",
-                                                                        rel_us,
-                                                                        event.event.switch_info.prev_pid,
-                                                                        event.event.switch_info.next_pid,
-                                                                        event.event.switch_info.event_cpu);
-                                                        } else if (event.type == SCHED_WAKEUP) {
-                                                                u64 rel_us = div_u64(event.event.wakeup_info.time - base, 1000);
-                                                                pr_info("[%6llu µs] Event: sched_wakeup, pid: %d, wake_cpu: %d\n",
-                                                                        rel_us,
-                                                                        event.event.wakeup_info.pid,
-                                                                        event.event.wakeup_info.wake_cpu);
-                                                        } else if (event.type == SYS_SLEEP) {
-                                                                u64 rel_us = div_u64(event.event.sleep_info.time - base, 1000);
-                                                                pr_info("Event: sys_sleep, pid: %d\n",
-                                                                        rel_us,
-                                                                        event.event.sleep_info.pid);
-                                                        }
-                                                }
-                                        }
-                                        if (v->response_violations) {
-                                                pr_info("  ResponseBound=%lld, Violations=%lld\n", v->response_bound, v->response_violations);
-                                                pr_info("RESPONSE TIME VIOLATION TRACE: \n");
-
-                                                int len = READ_ONCE(v->max_r_trace_len);
-                                                for (int i = 0; i < len; i++) {
-                                                        struct slo_event event = v->max_rt_violation_trace[i];
-                                                        if (event.type == SCHED_SWITCH) {
-                                                                pr_info("Event: sched_switch, preemption: %d, voluntary: %d, prev_pid: %d (priority: %d), next_pid: %d (priority: %d), on_cpu: %d, \n",
-                                                                        event.event.switch_info.preempt,
-                                                                        event.event.switch_info.prev_state & (TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE | TASK_PARKED | TASK_IDLE | TASK_DEAD),
-                                                                        event.event.switch_info.prev_pid,
-                                                                        event.event.switch_info.prev_prio,
-                                                                        event.event.switch_info.next_pid,
-                                                                        event.event.switch_info.next_prio,
-                                                                        event.event.switch_info.event_cpu);
-                                                        } else if (event.type == SCHED_WAKEUP) {
-                                                                pr_info("Event: sched_wakeup, pid: %d, wake_cpu: %d\n",
-                                                                        event.event.wakeup_info.pid,
-                                                                        event.event.wakeup_info.wake_cpu);
-                                                        } else if (event.type == SYS_SLEEP) {
-                                                                pr_info("Event: sys_sleep, pid: %d\n",
-                                                                        event.event.sleep_info.pid);
-                                                        }
-                                                }
-                                        }
-                                        if (v->response_relief_violations) {
-                                                pr_info("  ResponseReliefBound=%lld, Violations=%lld\n", v->response_relief_bound, v->response_relief_violations);
-                                                pr_info("RESPONSE TIME RELIEF VIOLATION TRACE: \n");
-
-                                                int len = READ_ONCE(v->max_rr_trace_len);
-                                                for (int i = 0; i < len; i++) {
-                                                        struct slo_event event = v->max_rtr_violation_trace[i];
-                                                        if (event.type == SCHED_SWITCH) {
-                                                                pr_info("Event: sched_switch, preemption: %d, voluntary: %d, prev_pid: %d (prio: %d), next_pid: %d (prio: %d), on_cpu: %d\n",
-                                                                        event.event.switch_info.preempt,
-                                                                        event.event.switch_info.prev_state & (TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE | TASK_PARKED | TASK_IDLE | TASK_DEAD),
-                                                                        event.event.switch_info.prev_pid,
-                                                                        event.event.switch_info.prev_prio,
-                                                                        event.event.switch_info.next_pid,
-                                                                        event.event.switch_info.next_prio,
-                                                                        event.event.switch_info.event_cpu);
-                                                        } else if (event.type == SCHED_WAKEUP) {
-                                                                pr_info("Event: sched_wakeup, pid: %d, wake_cpu: %d\n",
-                                                                        event.event.wakeup_info.pid,
-                                                                        event.event.wakeup_info.prio,
-                                                                        event.event.wakeup_info.wake_cpu);
-                                                        } else if (event.type == SYS_SLEEP) {
-                                                                pr_info("Event: sys_sleep, pid: %d\n",
-                                                                        event.event.sleep_info.pid);
-                                                        }
-                                                }
-                                        }
-                                }
+                        if (smp_load_acquire(&curr->active)) {
+                                stop_recording_pid(i);
                         }
                 }
                 vfree(pidtab);
@@ -1243,6 +1297,7 @@ static void __exit rt_module_exit(void)
         sysfs_remove_groups(rt_kobj, rt_groups);
         kobject_put(rt_kobj);
 }
+
 
 module_init(rt_module_init);
 module_exit(rt_module_exit);
