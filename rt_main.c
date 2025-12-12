@@ -110,12 +110,23 @@ struct task_latency_entry {
         bool trace_enabled;
 };
 
+enum slo_trace_mode {
+        TRACE_LATENCY,
+        TRACE_RESP_ALL,
+        TRACE_RESP_RELIEF,
+        TRACE_IRQT,
+};
 
 static void update_violation(enum stat_field field, s64 value, struct task_latency_entry *e);
 int collect_latency_violation_trace(struct task_latency_entry *e, int violation_event_index);
 int collect_response_violation_trace(struct task_latency_entry *entry, int violation_event_index);
-int collect_response_time_violation_trace(struct task_latency_entry *entry, int violation_event_index);
+int collect_response_relief_violation_trace(struct task_latency_entry *entry, int violation_event_index);
 int collect_irqt_violation_trace(struct task_latency_entry *entry, int violation_event_index);
+
+static bool should_include_event(enum slo_trace_mode mode, struct slo_event *se, pid_t task_pid, int len_so_far, int start_index);
+static int collect_slo_trace_common(struct task_latency_entry *e, int start_index, int violation_event_index,struct slo_event *dst, int *dst_len, enum slo_trace_mode mode);
+
+
 
 #define DEFINE_SLO_SETTER(name, field) \
 static void set_##name(pid_t pid, s64 value) { \
@@ -174,7 +185,7 @@ static __always_inline void update_minmax(enum stat_field choice,
                         break;
                 case RESPONSE_RELIEF:
                         if (UPDATE_MINMAX_FIELD(e, v, rt_relief_min_ns, rt_relief_max_ns)) {
-                                collect_response_time_violation_trace(e, violation_event_index);
+                                collect_response_relief_violation_trace(e, violation_event_index);
                         }
                         break;
                 case IRQ_HANDLING:
@@ -231,6 +242,22 @@ static int start_recording_pid(pid_t pid, bool traced)
         WRITE_ONCE(e->v.response_relief_violations, 0);
         WRITE_ONCE(e->v.irq_handling_bound, LLONG_MAX);
         WRITE_ONCE(e->v.irq_handling_violations, 0);
+        /* Latency */
+        WRITE_ONCE(e->v.max_l_start_index, 0);
+        WRITE_ONCE(e->v.max_l_trace_len, 0);
+
+        /* Response (voluntary sleep) */
+        WRITE_ONCE(e->v.max_r_start_index, 0);
+        WRITE_ONCE(e->v.max_r_trace_len, 0);
+
+        /* Response relief */
+        WRITE_ONCE(e->v.max_rr_start_index, 0);
+        WRITE_ONCE(e->v.max_rr_trace_len, 0);
+
+        /* IRQ handling */
+        WRITE_ONCE(e->v.max_i_start_index, 0);
+        WRITE_ONCE(e->v.max_i_trace_len, 0);
+        // TODO: make sure other variables in the recording and default structus are initialized correctly
 
         // Allocate if trace is enabled
         if (READ_ONCE(e->trace_enabled) == true) {
@@ -259,6 +286,19 @@ static int start_recording_pid(pid_t pid, bool traced)
         return 0;
 }
 
+
+static void print_prev_state(unsigned int s)
+{
+        if (s == TASK_RUNNING) {
+                pr_cont("RUNNING");
+                return;
+        }
+        if (s & TASK_INTERRUPTIBLE)   pr_cont(" INTERRUPTIBLE");
+        if (s & TASK_UNINTERRUPTIBLE) pr_cont(" UNINTERRUPTIBLE");
+        if (s & TASK_PARKED)          pr_cont(" PARKED");
+        if (s & TASK_IDLE)            pr_cont(" IDLE");
+        if (s & TASK_DEAD)            pr_cont(" DEAD");
+}
 
 /*
 This should be called for every program on exit to clean up.
@@ -295,6 +335,7 @@ static void stop_recording_pid(pid_t pid)
                 
                 struct task_stat_slo *v = &e->v;
                 // then print out the violation traces
+                // TODO: might want to DRY this printing, since filtering is done for r and rr, and irq, not for latency though (we could filtering for latency)
                 if (v->latency_violations) {
                         pr_info("  LatencyBound=%lld, Violations=%lld\n", v->latency_bound, v->latency_violations);
                         pr_info("WORST LATENCY TRACE: \n");
@@ -374,12 +415,14 @@ static void stop_recording_pid(pid_t pid)
 
                         if (e->trace_enabled) {
                                 int len = READ_ONCE(v->max_rr_trace_len);
-        
+
+                                u64 base = v->max_rt_violation_trace[0].event.wakeup_info.time;
                                 for (int i = 0; i < len; i++) {
                                         struct slo_event event = v->max_rtr_violation_trace[i];
                                         if (event.type == SCHED_SWITCH) {
                                                 pr_info("Event: sched_switch, preemption: %d, voluntary: %d, prev_pid: %d (prio: %d), next_pid: %d (prio: %d), on_cpu: %d\n",
                                                         event.event.switch_info.preempt,
+                                                        // TODO: Do better decoding for this prev state thing, (there are some random number that shows up e.g. 1026 don't know what this shit means)
                                                         event.event.switch_info.prev_state & (TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE | TASK_PARKED | TASK_IDLE | TASK_DEAD),
                                                         event.event.switch_info.prev_pid,
                                                         event.event.switch_info.prev_prio,
@@ -389,7 +432,6 @@ static void stop_recording_pid(pid_t pid)
                                         } else if (event.type == SCHED_WAKEUP) {
                                                 pr_info("Event: sched_wakeup, pid: %d, wake_cpu: %d\n",
                                                         event.event.wakeup_info.pid,
-                                                        event.event.wakeup_info.prio,
                                                         event.event.wakeup_info.wake_cpu);
                                         } else if (event.type == SYS_SLEEP) {
                                                 pr_info("Event: sys_sleep, pid: %d\n",
@@ -417,7 +459,6 @@ static void stop_recording_pid(pid_t pid)
                                         } else if (event.type == SCHED_WAKEUP) {
                                                 pr_info("Event: sched_wakeup, pid: %d, wake_cpu: %d\n",
                                                         event.event.wakeup_info.pid,
-                                                        event.event.wakeup_info.prio,
                                                         event.event.wakeup_info.wake_cpu);
                                         } else if (event.type == SYS_SLEEP) {
                                                 pr_info("Event: sys_sleep, pid: %d\n",
@@ -736,219 +777,133 @@ static void update_violation(enum stat_field field, s64 value, struct task_laten
  * 
  * PRECONDITION: pid is an active element 
  */
-int collect_latency_violation_trace(struct task_latency_entry *e, int violation_event_index) {
-        if (READ_ONCE(e->trace_enabled)) {
-                unsigned int flags;
-                spin_lock_irqsave(&event_queue.lock, flags);
-                u64 tail = event_queue.tail_seq;
-                u64 index = e->v.max_l_start_index;
-                if (tail > index)       // Tail has already went past our element
-                {
-                        // We won't record this because trace is broken
-                        spin_unlock_irqrestore(&event_queue.lock, flags);
-                        return -1;
-                }
-                // Tail hasn't gone past our element, save this part of the trace
-                struct slo_event *arr = e->v.max_l_violation_trace;
-                int len = 0;
-
-                for (int i = index; i <= violation_event_index && len < MAX_TRACE_LEN_PER_SLO; i++, len++) {
-                        struct slo_event *se = &event_queue.buf[i % QUEUE_LEN];
-                        arr[len] = *se;
-                }
-                WRITE_ONCE(e->v.max_l_trace_len, len);
-                spin_unlock_irqrestore(&event_queue.lock, flags);
-                return 0;
-        }
-        return 0;
+int collect_latency_violation_trace(struct task_latency_entry *entry, int violation_event_index) {
+        return collect_slo_trace_common(
+                entry,
+                READ_ONCE(entry->v.max_l_start_index),
+                violation_event_index,
+                entry->v.max_l_violation_trace,
+                &entry->v.max_l_trace_len,
+                (enum slo_trace_mode) TRACE_LATENCY
+        );
 }
 
-// TODO DRY - probably implement a selector within the trace collecting loop (what particular to include?)
 int collect_response_violation_trace(struct task_latency_entry *entry, int violation_event_index) {
-        if (READ_ONCE(entry->trace_enabled))
-        {
-                unsigned int flags;
-                spin_lock_irqsave(&event_queue.lock, flags);
-                u64 tail = event_queue.tail_seq;
-                u64 index = entry->v.max_r_start_index;
-                if (tail > index)       // Tail has already went past our element
-                {
-                        // We won't record this because trace is broken
-                        // pr_info("max_l_index got polluted?\n");
-                        spin_unlock_irqrestore(&event_queue.lock, flags);
-                        return -1;
-                }
-
-                // Case - Tail hadn't gone past our element, save this trace
-                struct slo_event *arr = entry->v.max_rt_violation_trace;
-                if (arr == NULL) {
-                        spin_unlock_irqrestore(&event_queue.lock, flags);
-                        return -1;
-                }
-
-                pid_t task_pid = entry->pid;
-                int len = 0;
-
-                for (int i = index; i <= violation_event_index && len < MAX_TRACE_LEN_PER_SLO; i++) {
-                        struct slo_event *se = &event_queue.buf[i % QUEUE_LEN];
-                        
-                        // so this encapsulates latency and also the run until the sleep
-                        // we care about teh first wakeup
-                        // I don't think we want to deal with schedule in's here
-                        // Deal only with preemptions and switch backs. 
-                        // sleep should be included.
-                        if (len == 0 && se->type == SCHED_WAKEUP) {
-                                arr[len] = *se;
-                                len = len+1;
-                        } else if (len > 0 && 
-                                se->type == SCHED_SWITCH && 
-                                (se->event.switch_info.prev_pid == task_pid || se->event.switch_info.next_pid == task_pid))
-                        {
-                                arr[len] = *se;
-                                len = len+1;
-                        } else if (len > 0 &&
-                                se->type == SYS_SLEEP &&
-                                se->event.sleep_info.pid == task_pid) 
-                        {
-                                arr[len] = *se;
-                                len = len+1;
-                        }
-                        // Only increase len when we actually add something to our trace.
-                }
-                WRITE_ONCE(entry->v.max_r_trace_len, len);
-                spin_unlock_irqrestore(&event_queue.lock, flags);
-
-                return 0;
-
-        }
-        return 0;
+        return collect_slo_trace_common(
+                entry,
+                READ_ONCE(entry->v.max_r_start_index),
+                violation_event_index,
+                entry->v.max_rt_violation_trace,
+                &entry->v.max_r_trace_len,
+                (enum slo_trace_mode) TRACE_RESP_ALL
+        );
 }
 
-// TODO DRY
-int collect_response_time_violation_trace(struct task_latency_entry *entry, int violation_event_index) {
-        if (READ_ONCE(entry->trace_enabled))
-        {
-                unsigned int flags;
-                spin_lock_irqsave(&event_queue.lock, flags);
-                u64 tail = event_queue.tail_seq;
-                u64 index = entry->v.max_rr_start_index;
-                if (tail > index)       // Tail has already went past our element
-                {
-                        // We won't record this because trace is broken
-                        spin_unlock_irqrestore(&event_queue.lock, flags);
-                        return -1;
-                }
-
-                // Case - Tail hadn't gone past our element, save this trace
-                struct slo_event *arr = entry->v.max_rtr_violation_trace;
-                if (arr == NULL) {
-                        spin_unlock_irqrestore(&event_queue.lock, flags);
-                        return -1;
-                }
-
-                pid_t task_pid = entry->pid;
-                int len = 0;
-
-                for (int i = index; i <= violation_event_index && len < MAX_TRACE_LEN_PER_SLO; i++) {
-                        struct slo_event *se = &event_queue.buf[i % QUEUE_LEN];
-                        
-                        // so this encapsulates latency, compute, some voluntary sleep, and the relief sleep
-                        // we care about teh first wakeup (don't care about the latency stuff)
-                        // Deal only with preemption cycles. Deal with voluntary swtich back cycles
-                        // sleep should be included (for the final sleep+switchout at the end)
-                        if (len == 0 && se->type == SCHED_WAKEUP) {
-                                arr[len] = *se;
-                                len = len+1;
-                        } else if (len > 0 && 
-                                se->type == SCHED_SWITCH && 
-                                (se->event.switch_info.prev_pid == task_pid || se->event.switch_info.next_pid == task_pid))
-                        {
-                                arr[len] = *se;
-                                len = len+1;
-                        } else if (len > 0 &&
-                                se->type == SYS_SLEEP &&
-                                se->event.sleep_info.pid == task_pid) 
-                        {
-                                arr[len] = *se;
-                                len = len+1;
-                        }
-                        // Only increase len when we actually add something to our trace.
-                }
-                WRITE_ONCE(entry->v.max_rr_trace_len, len);
-                spin_unlock_irqrestore(&event_queue.lock, flags);
-
-                return 0;
-        }
-        return 0;
+int collect_response_relief_violation_trace(struct task_latency_entry *entry, int violation_event_index) {
+        return collect_slo_trace_common(
+                entry,
+                READ_ONCE(entry->v.max_rr_start_index),
+                violation_event_index,
+                entry->v.max_rtr_violation_trace,
+                &entry->v.max_rr_trace_len,
+                TRACE_RESP_RELIEF
+        );
 }
 
-// TODO DRY!!!!
 int collect_irqt_violation_trace(struct task_latency_entry *entry, int violation_event_index) {
-        if (READ_ONCE(entry->trace_enabled))
-        {
-                unsigned int flags;
-                spin_lock_irqsave(&event_queue.lock, flags);
-                u64 tail = event_queue.tail_seq;
-                u64 index = entry->v.max_i_start_index;
-                if (tail > index)       // Tail has already went past our element
-                {
-                        // We won't record this because trace is broken
-                        spin_unlock_irqrestore(&event_queue.lock, flags);
-                        return -1;
-                }
+        return collect_slo_trace_common(
+                entry, 
+                READ_ONCE(entry->v.max_i_start_index),
+                violation_event_index,
+                entry->v.max_irqt_violation_trace,
+                &entry->v.max_i_trace_len,
+                TRACE_IRQT
+        );
+}
 
-                // Case - Tail hadn't gone past our element, save this trace
-                struct slo_event *arr = entry->v.max_irqt_violation_trace;
-                if (arr == NULL) {
-                        spin_unlock_irqrestore(&event_queue.lock, flags);
-                        return -1;
-                }
 
-                pid_t task_pid = entry->pid;
-                int len = 0;
-
-                for (int i = index; i <= violation_event_index && len < MAX_TRACE_LEN_PER_SLO; i++) {
-                        struct slo_event *se = &event_queue.buf[i % QUEUE_LEN];
-                        
-                        // this encapsulates point before irqthread starts running handler,
-                        // then it might get preempted cycle, it might do a voluntary cycle or sleep, and then it ends
-                        if (len == 0 && se->type == IRQT_ENTRY) {
-                                arr[len] = *se;
-                                len = len+1;
-                        } else if (len > 0 &&
-                                se->type == SCHED_WAKEUP &&
-                                se->event.wakeup_info.pid == task_pid)
-                        {
-                                arr[len] = *se;
-                                len = len+1;
-                        } else if (len > 0 && 
-                                se->type == SCHED_SWITCH && 
-                                (se->event.switch_info.prev_pid == task_pid || se->event.switch_info.next_pid == task_pid))
-                        {
-                                arr[len] = *se;
-                                len = len+1;
-                        } else if (len > 0 &&
-                                se->type == SYS_SLEEP &&
-                                se->event.sleep_info.pid == task_pid) 
-                        {
-                                arr[len] = *se;
-                                len = len+1;
-                        } else if (len > 0 &&
-                                se->type == IRQT_EXIT &&
-                                se->event.irqt_exit_info.pid == task_pid)
-                        {
-                                arr[len] = *se;
-                                len = len+1;
-                        } 
-                        // Only increase len when we actually add something to our trace.
-                }
-                WRITE_ONCE(entry->v.max_i_trace_len, len);
-                spin_unlock_irqrestore(&event_queue.lock, flags);
-
+static int collect_slo_trace_common(struct task_latency_entry *e,
+                                        int start_index,
+                                        int violation_event_index,
+                                        struct slo_event *dst,
+                                        int *dst_len,
+                                        enum slo_trace_mode mode)
+{
+        unsigned int flags;
+        int len = 0;
+        if (!READ_ONCE(e->trace_enabled)) {
                 return 0;
         }
+        if (!dst || !dst_len) {
+                return -EINVAL;
+        }
+        spin_lock_irqsave(&event_queue.lock, flags);
+
+        u64 tail = event_queue.tail_seq;
+        if (tail > start_index) {
+                spin_unlock_irqrestore(&event_queue.lock, flags);
+                return -1;
+        }
+
+        for (int i = start_index; i <= violation_event_index && len < MAX_TRACE_LEN_PER_SLO; i++) {
+                struct slo_event *se = &event_queue.buf[i % QUEUE_LEN];
+
+                if (should_include_event(mode, se, e->pid, i, start_index)) {
+                        dst[len] = *se;
+                        len = len + 1;
+                }
+
+        }
+        spin_unlock_irqrestore(&event_queue.lock, flags);
+        *dst_len = len;
+
         return 0;
 }
+
+static bool should_include_event(enum slo_trace_mode mode, struct slo_event *se, pid_t task_pid, int len_so_far, int start_index) 
+{
+        switch (mode) {
+                case TRACE_LATENCY:
+                        return true;
+                case TRACE_RESP_ALL:
+                case TRACE_RESP_RELIEF:
+                        if (len_so_far == start_index) {
+                                return se->type == SCHED_WAKEUP;
+                        }
+                        if (len_so_far > start_index){
+                                if (se->type == SCHED_SWITCH && 
+                                (se->event.switch_info.prev_pid == task_pid || se->event.switch_info.next_pid == task_pid)) {
+                                        return true;
+                                }
+                                if (se->type == SYS_SLEEP &&
+                                se->event.sleep_info.pid == task_pid) {
+                                        return true;
+                                }
+                        }
+                        return false;
+                case TRACE_IRQT:
+                        if (len_so_far == start_index) {
+                                return se->type == IRQT_ENTRY;
+                        }
+                        if (len_so_far > start_index) {
+                                if (se->type == SCHED_SWITCH && 
+                                (se->event.switch_info.prev_pid == task_pid || se->event.switch_info.next_pid == task_pid)) {
+                                        return true;
+                                }
+                                if (se->type == SYS_SLEEP &&
+                                se->event.sleep_info.pid == task_pid) {
+                                        return true;
+                                }
+                                if (se->type == IRQT_EXIT &&
+                                se->event.irqt_exit_info.pid == task_pid) {
+                                        return true;
+                                }
+                        }
+                        return false;
+        }
+        return false;
+}
+
 
 /*
 Used to find the correct tracepoint that we want to hook onto
