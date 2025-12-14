@@ -7,6 +7,7 @@
  * Do a burst of CPU work and then do a write. and accidentally include an extra voluntary sleep.
  * This showcases a bad case for the tool.
  */
+#define _GNU_SOURCE
 
 #include <sys/eventfd.h>
 #include <unistd.h>
@@ -28,12 +29,19 @@ sem_t sem;
 static int efd;
 
 static volatile uint64_t sink;
+static uint32_t lcg = 1234567;
 
 static void busy_loop_ns(uint64_t ns, uint64_t cntfrq);
 
 static void nsleep_ns(long ns) {
         struct timespec ts = { .tv_sec = ns/1000000000L, .tv_nsec = ns%1000000000L };
         nanosleep(&ts, NULL);
+}
+
+static inline uint32_t fast_rand(void)
+{
+        lcg = lcg * 1103515245 + 12345;
+        return lcg;
 }
 
 static inline uint64_t read_cntfrq(void) {
@@ -51,7 +59,7 @@ static inline uint64_t read_cntvct(void) {
 
 void *event_thread(void *arg) {
         for (;;) {
-                long jitter = 500000 + (rand() % 5000000);
+                long jitter = 500000 + (fast_rand() % 5000000);
                 nsleep_ns(jitter);
                 uint64_t one = 1;
                 write(efd, &one, sizeof(one));
@@ -71,16 +79,26 @@ void *blocking_thread(void *arg) {
 
 
 int main(void) {
-        mlockall(MCL_CURRENT | MCL_FUTURE);
+        if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+                perror("mlockall");
+        }
 
         // Find the freq for the busy loop
         uint64_t frq = read_cntfrq();
         printf("cntfrq=%llu Hz\n", (unsigned long long)frq);
 
         // Setup blocking semaphore
-        sem_init(&sem, 0, 0);
+        if (sem_init(&sem, 0, 0) != 0) {
+                perror("sem_init");
+                return 1;
+        }
+        
         // Setup the eventfd obj
         efd = eventfd(0, 0);
+        if (efd < 0) {
+                perror("eventfd");
+                return 1;
+        }
 
         // Notifier thread and blocking thread
         pthread_t btid, ntid;
@@ -116,20 +134,20 @@ int main(void) {
 
         // Create threads with their own attrs
         if (pthread_create(&btid, &battr, blocking_thread, NULL) != 0) {
-        perror("pthread_create blocking_thread");
+                perror("pthread_create blocking_thread");
         }
         if (pthread_create(&ntid, &nattr, event_thread, NULL) != 0) {
-        perror("pthread_create event_thread");
+                perror("pthread_create event_thread");
         }
 
         for (;;) {
                 uint64_t v;
                 read(efd, &v, sizeof(v));
 
-                // accidental voluntary sleep - probably done with a semaphore. not sure where to place this yet
-                sem_wait(&sem);
-
                 busy_loop_ns(WORK_PERIOD_NS, frq);
+
+                // accidental voluntary sleep
+                sem_wait(&sem);
         }
 }
 
