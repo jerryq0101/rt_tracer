@@ -1,19 +1,54 @@
 #define _GNU_SOURCE
 
-// ... other imports
-#include <pthread.h>
+#include <pthread.h>    // pthread_*, pthread_mutex_*, pthread_attr_*
+#include <time.h>       // struct timespec, nanosleep, clock_gettime, clock_nanosleep
+#include <stdint.h>     // uint64_t, etc
+#include <stdio.h>      // printf, perror
+#include <errno.h>      // errno (optional but useful)
+#include <string.h>     // strerror (optional)
+#include <sys/mman.h>   // mlockall, MCL_CURRENT, MCL_FUTURE
+#include <sched.h>      // SCHED_FIFO, CPU_SET/CPU_ZERO, cpu_set_t
+#include <unistd.h>     // (optional) for misc POSIX things
 
-#define LOW_PRIO_WORK_PERIOD 10000000
-#define LOW_PRIO_SLEEP_PERIOD 100000
 
-#define MED_PRIO_WORK_PERIOD 10000000
-#define MED_PRIO_SLEEP_PERIOD 1000
+/**
+ * Priorities (SCHED_FIFO):
+ * High = 90
+ * Med = 50
+ * Low = 10
+ */
+#define LOW_PRIO_WORK_PERIOD 2000000   // 2ms
+#define LOW_PRIO_SLEEP_PERIOD 100000    // 0.1ms
+
+#define MED_PRIO_WORK_PERIOD 10000000   // 10ms
+#define MED_PRIO_SLEEP_PERIOD 1000000    // 1ms
+
+#define HIGH_PRIO_SLEEP_PERIOD 5000000 // 5ms
+#define HIGH_PRIO_WORK_PERIOD 1000000 // 1ms
 
 pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 uint64_t frq;
 
 static volatile unsigned long counter;
 static volatile uint64_t sink;
+
+static void busy_loop_ns(uint64_t ns, uint64_t cntfrq);
+
+
+static inline struct timespec ns_to_ts(uint64_t ns) {
+    struct timespec ts;
+    ts.tv_sec  = ns / 1000000000ULL;
+    ts.tv_nsec = ns % 1000000000ULL;
+    return ts;
+}
+
+static inline void ts_add_ns(struct timespec *t, uint64_t ns) {
+    t->tv_nsec += ns;
+    while (t->tv_nsec >= 1000000000ULL) {
+        t->tv_nsec -= 1000000000ULL;
+        t->tv_sec++;
+    }
+}
 
 /**
  * Grabs lock that the high prio thread needs.
@@ -25,16 +60,22 @@ static volatile uint64_t sink;
 void *low_prio_thread(void *arg) {
         for (;;) {
                 pthread_mutex_lock(&lock);
-                
+
                 busy_loop_ns(LOW_PRIO_WORK_PERIOD, frq);
 
                 pthread_mutex_unlock(&lock);
 
                 // Sleep X from now
-                // TODO: INVALID timespec for nanosleep
                 // TODO: making sure that the low prio thread actually runs to hold it (maybe doing a multicore situation is better)
-                // TODO: getting imports sorted
-                nanosleep(LOW_PRIO_SLEEP_PERIOD, NULL);
+                // What is going on right now: 
+                // low gets spawned on CPU2 and then grabs lock 
+                // med gets in preempts low
+                // so med just continuously runs while low holds the lock
+                // The High prio program runs on another CPU and just can't unlock.
+                
+                // TODO: Implement a quick initialize so that it captures the initial behaviour
+                struct timespec ts = ns_to_ts(LOW_PRIO_SLEEP_PERIOD);
+                nanosleep(&ts, NULL);
         }
 }
 
@@ -48,7 +89,8 @@ void *med_prio_thread(void *arg) {
                 busy_loop_ns(MED_PRIO_WORK_PERIOD, frq);
                 
                 // Sleep X from now
-                nanosleep(MED_PRIO_SLEEP_PERIOD, NULL);
+                struct timespec ts = ns_to_ts(MED_PRIO_SLEEP_PERIOD);
+                nanosleep(&ts, NULL);
         }
 }
 
@@ -139,13 +181,16 @@ int main(void) {
         }
 
         // Main high priority loop
+        struct timespec next;
+        clock_gettime(CLOCK_MONOTONIC, &next);
+
         // Pretend we have absolute time
         for (;;) {
                 // Next workload
-                ts_add_ns(&next, PERIOD_NS);
+                ts_add_ns(&next, HIGH_PRIO_SLEEP_PERIOD);
 
                 // do some computation here (1ms)
-                busy_loop_ns(WORK_PERIOD_NS, frq);
+                busy_loop_ns(HIGH_PRIO_WORK_PERIOD, frq);
                 counter = counter % 1000000000 + 1;
                 
                 // mutex acquisition
