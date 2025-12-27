@@ -390,6 +390,14 @@ static void stop_recording_pid(pid_t pid)
 
 	// to prevent double stop (e.g. rmmod and program exit happens at the same time)
 	if (xchg(&e->active, false)) {
+                unsigned int flags;
+
+                // Take its pre trace lock to ensure that it finishes its previous trace updates
+                raw_spin_lock_irqsave(&e->lat_trace_lock, flags);
+                raw_spin_lock_irqsave(&e->resp_trace_lock, flags);
+                raw_spin_lock_irqsave(&e->resp_relief_trace_lock, flags);
+                raw_spin_lock_irqsave(&e->irq_trace_lock, flags);
+
 		// print some base statistics
 		// special case for IRQs
 		bool is_irq = false;
@@ -427,6 +435,11 @@ static void stop_recording_pid(pid_t pid)
 			pr_info("  IRQHandlingBound=%lld, Violations=%lld\n", v->irq_handling_bound, v->irq_handling_violations);
 			print_single_trace(e, &e->v, e->v.max_irqt_violation_trace, e->v.max_i_trace_len, IRQ_HANDLING);
 		}
+
+                raw_spin_unlock_irqrestore(&e->lat_trace_lock, flags);
+                raw_spin_unlock_irqrestore(&e->resp_trace_lock, flags);
+                raw_spin_unlock_irqrestore(&e->resp_relief_trace_lock, flags);
+                raw_spin_unlock_irqrestore(&e->irq_trace_lock, flags);
 
                 // Don't free here.
 		// if (xchg(&e->trace_enabled, false)) {
@@ -1233,6 +1246,8 @@ static void __exit rt_module_exit(void)
 
 	// Wait so that probe function is not still running on other cores
 	tracepoint_synchronize_unregister();
+
+        // Ensures that last potential trace update has happened.
 
 	if (pidtab) {
 		for (int i = 0; i < PIDTAB_SIZE; i++) {
