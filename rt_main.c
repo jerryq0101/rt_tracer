@@ -12,6 +12,7 @@
 #include <linux/kobject.h>
 #include <linux/sysfs.h>
 #include <linux/interrupt.h>
+#include <linux/atomic.h>
 #include <asm/unistd.h>
 #include <asm/cmpxchg.h>
 #include "trace_ring_buffer.h"
@@ -39,34 +40,34 @@ enum stat_field { LATENCY, RESPONSE, RESPONSE_RELIEF, IRQ_HANDLING };
 enum sleep_cause {
 	SC_NONE = 0,
 	SC_TIMER,
-	SC_OTHER, // FUTURE: SC_LOCK, SC_IO, etc for other potential state tacking
+	SC_OTHER, // FUTURE: SC_LOCK, SC_IO, etc for other potential state tracking
 };
 
 struct task_stat_slo {
 	// For Latency
 	s64 latency_bound;
-	int latency_violations;
+	atomic_t latency_violations;
 	int max_l_start_index;
 	int max_l_trace_len;
 	struct slo_event *max_l_violation_trace;
 
 	// For Response time voluntary sleep
 	s64 response_bound;
-	int response_violations;
+	atomic_t response_violations;
 	int max_r_start_index;
 	int max_r_trace_len;
 	struct slo_event *max_rt_violation_trace;
 
 	// Response time relief sleep
 	s64 response_relief_bound;
-	int response_relief_violations;
+	atomic_t response_relief_violations;
 	int max_rr_start_index;
 	int max_rr_trace_len;
 	struct slo_event *max_rtr_violation_trace;
 
 	// IRQ tracepoints
 	s64 irq_handling_bound;
-	int irq_handling_violations;
+	atomic_t irq_handling_violations;
 	int max_i_start_index;
 	int max_i_trace_len;
 	struct slo_event *max_irqt_violation_trace;
@@ -325,13 +326,13 @@ static int start_recording_pid(pid_t pid, bool traced)
 
 	// SLO violation
 	WRITE_ONCE(e->v.latency_bound, LLONG_MAX);
-	WRITE_ONCE(e->v.latency_violations, 0);
+        atomic_set(&(e->v.latency_violations), 0);
 	WRITE_ONCE(e->v.response_bound, LLONG_MAX);
-	WRITE_ONCE(e->v.response_violations, 0);
+        atomic_set(&(e->v.response_violations), 0);
 	WRITE_ONCE(e->v.response_relief_bound, LLONG_MAX);
-	WRITE_ONCE(e->v.response_relief_violations, 0);
+        atomic_set(&(e->v.response_relief_violations), 0);
 	WRITE_ONCE(e->v.irq_handling_bound, LLONG_MAX);
-	WRITE_ONCE(e->v.irq_handling_violations, 0);
+        atomic_set(&(e->v.irq_handling_violations), 0);
 	/* Latency */
 	WRITE_ONCE(e->v.max_l_start_index, 0);
 	WRITE_ONCE(e->v.max_l_trace_len, 0);
@@ -419,20 +420,19 @@ static void stop_recording_pid(pid_t pid)
 		struct task_stat_slo *v = &e->v;
 		// then print out the violation traces
 		if (v->latency_bound != LLONG_MAX) {
-			pr_info("  LatencyBound=%lld, Violations=%lld\n", v->latency_bound, v->latency_violations);
+			pr_info("  LatencyBound=%lld, Violations=%lld\n", v->latency_bound, atomic_read(&(v->latency_violations)));
 			print_single_trace(e, &e->v, e->v.max_l_violation_trace, e->v.max_l_trace_len, LATENCY);
 		}
 		if (v->response_bound != LLONG_MAX) {
-			pr_info("  ResponseBound=%lld, Violations=%lld\n", v->response_bound, v->response_violations);
+			pr_info("  ResponseBound=%lld, Violations=%lld\n", v->response_bound, atomic_read(&(v->response_violations)));
 			print_single_trace(e, &e->v, e->v.max_rt_violation_trace, e->v.max_r_trace_len, RESPONSE);
 		}
 		if (v->response_relief_bound != LLONG_MAX) {
-			pr_info("  ResponseReliefBound=%lld, Violations=%lld\n", v->response_relief_bound,
-				v->response_relief_violations);
+			pr_info("  ResponseReliefBound=%lld, Violations=%lld\n", v->response_relief_bound, atomic_read(&(v->response_relief_violations)));
 			print_single_trace(e, &e->v, e->v.max_rtr_violation_trace, e->v.max_rr_trace_len, RESPONSE_RELIEF);
 		}
 		if (v->irq_handling_bound != LLONG_MAX && is_irq) {
-			pr_info("  IRQHandlingBound=%lld, Violations=%lld\n", v->irq_handling_bound, v->irq_handling_violations);
+			pr_info("  IRQHandlingBound=%lld, Violations=%lld\n", v->irq_handling_bound, atomic_read(&(v->irq_handling_violations)));
 			print_single_trace(e, &e->v, e->v.max_irqt_violation_trace, e->v.max_i_trace_len, IRQ_HANDLING);
 		}
 
@@ -762,29 +762,33 @@ static void update_violation(enum stat_field field, s64 value, struct task_laten
 	switch (field) {
 	case LATENCY:
 		/**
-                         * This value update is intended for latency
-                         */
+                 * This value update is intended for latency
+                 */
 		bound = READ_ONCE(e->v.latency_bound);
 		if (value > bound) {
-			WRITE_ONCE(e->v.latency_violations, READ_ONCE(e->v.latency_violations) + 1);
+			// WRITE_ONCE(e->v.latency_violations, READ_ONCE(e->v.latency_violations) + 1);
+                        atomic_inc(&(e->v.latency_violations));
 		}
 		break;
 	case RESPONSE:
 		bound = READ_ONCE(e->v.response_bound);
 		if (value > bound) {
-			WRITE_ONCE(e->v.response_violations, READ_ONCE(e->v.response_violations) + 1);
+			// WRITE_ONCE(e->v.response_violations, READ_ONCE(e->v.response_violations) + 1);
+                        atomic_inc(&(e->v.response_violations));
 		}
 		break;
 	case RESPONSE_RELIEF:
 		bound = READ_ONCE(e->v.response_relief_bound);
 		if (value > bound) {
-			WRITE_ONCE(e->v.response_relief_violations, READ_ONCE(e->v.response_relief_violations) + 1);
+			// WRITE_ONCE(e->v.response_relief_violations, READ_ONCE(e->v.response_relief_violations) + 1);
+                        atomic_inc(&(e->v.response_relief_violations));
 		}
 		break;
 	case IRQ_HANDLING:
 		bound = READ_ONCE(e->v.irq_handling_bound);
 		if (value > bound) {
-			WRITE_ONCE(e->v.irq_handling_violations, READ_ONCE(e->v.irq_handling_violations) + 1);
+			// WRITE_ONCE(e->v.irq_handling_violations, READ_ONCE(e->v.irq_handling_violations) + 1);
+                        atomic_inc(&(e->v.irq_handling_violations));
 		}
 		break;
 	default:
