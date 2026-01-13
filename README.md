@@ -32,7 +32,8 @@ This is specifically designed for and evaluted on Raspberry Pi 4 (SMP) running B
 ### Notes
 - `jerry_rt_module/irq_button_demo` is the kernel module made to configure an GPIO on the PI as an IRQ line, and its according handlers.
 - `jerry_rt_module/jerry` is the kernel patch needed for the IRQ tracing. <b>TODO: Without kernel patch, the module won't load. I need to make this an optional feature.</b>
-- Other files are either with the main kernel module or workload folders used to test, featured in `writeup.pdf`.
+- Other files are either with the main kernel module or workload folders used to analyze and validate, featured in `writeup.pdf`.
+- Cross compiled binaries by `aarch64-linux-gnu-gcc` are included in workload folders.
 
 ### Disclaimers 
 Note: Despite the name, the current evaluation was performed on a PREEMPT (low latency) kernel rather than PREEMPT_RT. As a result, some wording in repo/writeup.pdf may refer to PREEMPT_RT semantics imprecisely.
