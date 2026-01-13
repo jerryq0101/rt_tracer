@@ -163,7 +163,6 @@ int main(void) {
         pthread_attr_setschedparam(&lattr, &lsp);
         pthread_attr_setschedparam(&mattr, &msp);
 
-        // CPU affinity: blocking thread on CPU2, notifier thread on CPU3
         CPU_ZERO(&lcpu);
         CPU_SET(2, &lcpu);
         pthread_attr_setaffinity_np(&lattr, sizeof(lcpu), &lcpu);

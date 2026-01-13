@@ -35,6 +35,11 @@ static struct tracepoint *tp_irq_threaded_handler_entry;
 static struct tracepoint *tp_irq_threaded_handler_exit;
 static struct tracepoint *tp_sched_process_exit;
 
+// Global value for doing evaluation
+static atomic64_t total_probe_hits;
+static atomic64_t total_time_ns;
+static atomic64_t max_time_ns;
+
 enum stat_field { LATENCY, RESPONSE, RESPONSE_RELIEF, IRQ_HANDLING };
 
 enum sleep_cause {
@@ -100,7 +105,7 @@ struct task_latency_entry {
 	s64 rt_relief_min_ns; // Min Response time
 
 	// IRQ handler (kernel patch) statistics
-	s64 last_handler_call_entry;
+	s64 last_handler_call_entry; 
 	s64 irq_handle_max_ns; // max single interrupt handling iteration in the loop
 	s64 irq_handle_min_ns;
 
@@ -524,6 +529,10 @@ Task is running
 static void probe_sched_switch(void *data, bool preempt, struct task_struct *prev, struct task_struct *next,
 			       unsigned int prev_state)
 {
+        u64 t0 = ktime_get_ns();
+
+        atomic64_inc(&total_probe_hits);
+
 	// Record sched_switch event on ring
 	struct slo_event switch_event = { 0 };
 	switch_event.type = SCHED_SWITCH;
@@ -588,6 +597,15 @@ static void probe_sched_switch(void *data, bool preempt, struct task_struct *pre
 			}
 		}
 	}
+        u64 dt = ktime_get_ns() - t0;
+        atomic64_add(dt, &total_time_ns);
+
+        u64 old = atomic64_read(&max_time_ns);
+        while (dt > old) {
+                u64 prev = atomic64_cmpxchg(&max_time_ns, old, dt);
+                if (prev == old) break;
+                old = prev;
+        }
 }
 
 /*
@@ -595,6 +613,9 @@ Function that would be called when sched_wakeup happens.
 */
 static void probe_sched_wakeup(void *data, struct task_struct *p)
 {
+        u64 t0 = ktime_get_ns();
+        atomic64_inc(&total_probe_hits);
+
 	// Record event into ring buffer
 	struct slo_event wakeup_event = { 0 };
 	wakeup_event.type = SCHED_WAKEUP;
@@ -635,6 +656,16 @@ static void probe_sched_wakeup(void *data, struct task_struct *p)
 			WRITE_ONCE(e->v.max_rr_start_index, store_index);
 		}
 	}
+        
+        u64 dt = ktime_get_ns() - t0;
+        atomic64_add(dt, &total_time_ns);
+
+        u64 old = atomic64_read(&max_time_ns);
+        while (dt > old) {
+                u64 prev = atomic64_cmpxchg(&max_time_ns, old, dt);
+                if (prev == old) break;
+                old = prev;
+        }
 }
 
 static __always_inline bool is_timer_sleep_syscall(long id)
@@ -664,6 +695,9 @@ The "sys enter" handler will only handle sleeps
 */
 static void probe_sys_enter(void *data, struct pt_regs *regs, long id)
 {
+        u64 t0 = ktime_get_ns();
+        atomic64_inc(&total_probe_hits);
+
 	if (!is_timer_sleep_syscall(id)) {
 		return;
 	}
@@ -680,6 +714,16 @@ static void probe_sys_enter(void *data, struct pt_regs *regs, long id)
 	slo_queue_push(sleep_event);
 
 	WRITE_ONCE(e->scause, SC_TIMER);
+
+        u64 dt = ktime_get_ns() - t0;
+        atomic64_add(dt, &total_time_ns);
+
+        u64 old = atomic64_read(&max_time_ns);
+        while (dt > old) {
+                u64 prev = atomic64_cmpxchg(&max_time_ns, old, dt);
+                if (prev == old) break;
+                old = prev;
+        }
 }
 
 /*
@@ -740,6 +784,8 @@ Handler for process natural exit
 */
 static void probe_sched_process_exit(void *data, struct task_struct *p)
 {
+        u64 t0 = ktime_get_ns();
+        atomic64_inc(&total_probe_hits);
 	pid_t pid = p->pid;
 	struct task_latency_entry *e = slot_for(pid);
 
@@ -747,6 +793,16 @@ static void probe_sched_process_exit(void *data, struct task_struct *p)
 		return;
 	}
 	stop_recording_pid(pid);
+
+        u64 dt = ktime_get_ns() - t0;
+        atomic64_add(dt, &total_time_ns);
+
+        u64 old = atomic64_read(&max_time_ns);
+        while (dt > old) {
+                u64 prev = atomic64_cmpxchg(&max_time_ns, old, dt);
+                if (prev == old) break;
+                old = prev;
+        }
 }
 
 /**
@@ -1250,6 +1306,15 @@ static void __exit rt_module_exit(void)
 
 	// Wait so that probe function is not still running on other cores
 	tracepoint_synchronize_unregister();
+
+        // Print Evaluation statistics
+        pr_info("probe hits=%lld total_time=%lld ns avg=%lld ns max=%lld ns\n",
+                atomic64_read(&total_probe_hits),
+                atomic64_read(&total_time_ns),
+                div64_u64(atomic64_read(&total_time_ns),
+                        atomic64_read(&total_probe_hits)),
+                atomic64_read(&max_time_ns)
+        );
 
         // Ensures that last potential trace update has happened.
 

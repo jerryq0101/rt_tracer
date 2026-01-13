@@ -2,9 +2,7 @@
 #include <time.h>     // clock_gettime(), struct timespec
 #include <stdint.h>   // int64_t / uint64_t if you use them
 
-#define PERIOD_NS 5000000  // 5ms
-#define WORK_PERIOD_NS 4000000 // 4ms
-
+#define PERIOD_NS 1000000  // 5ms, previously. Now, 1ms to use for cyclictest background workload
 
 static inline void ts_add_ns(struct timespec *ts, long ns) {
     ts->tv_nsec += ns;
