@@ -7,8 +7,34 @@ This is specifically designed for and evaluted on Raspberry Pi 4 (SMP) running B
 - Any Raspberry Pi 4 compatible Linux kernel with the PREEMPT or PREEMPT_RT model.
     - My OS: Linux buildroot 6.12.41-v8 #1 SMP PREEMPT Thu Nov 20 17:18:47 UTC 2025 aarch64 GNU/Linux
 
+## Table of Contents
+- [jerry_rt_module](#jerry_rt_module)
+    - [Quick Notes](#notes)
+    - [Disclaimers](#disclaimers)
+- [Motivation](#motivation)
+- [Features](#features)
+- [Design Highlights](#design-highlights)
+- [Installation](#installation)
+  - [Build a PREEMPT_RT Kernel for Raspberry Pi 4](#1-build-a-preempt_rt-kernel-for-raspberry-pi-4)
+  - [Build and Load the Kernel Module](#2-build-and-load-the-kernel-module)
+  - [IRQ Demo Module](#3-irq-demo-module)
+- [Usage](#usage)
+  - [Loading the Module](#loading-the-module)
+  - [Track a PID](#track-a-pid)
+  - [Configure SLO Bounds](#configure-slo-bounds-violations--trace)
+  - [Stop Tracking](#stop-tracking)
+  - [Complete Example](#complete-example)
+- [Example Output](#example-output)
+- [Control Plane Precision](#control-plane-precision)
+- [Conclusion and Further Reading](#conclusion-and-further-reading)
+- [Future Work](#future-work)
 
+### Notes
+- `jerry_rt_module/irq_button_demo` is the kernel module made to configure an GPIO on the PI as an IRQ line, and its according handlers.
+- `jerry_rt_module/jerry` is the kernel patch needed for the IRQ tracing. <b>TODO: Without kernel patch, the module won't load. I need to make this an optional feature.</b>
+- Other files are either with the main kernel module or workload folders used to test, featured in `writeup.pdf`.
 
+### Disclaimers 
 Note: Despite the name, the current evaluation was performed on a PREEMPT (low latency) kernel rather than PREEMPT_RT. As a result, some wording in repo/writeup.pdf may refer to PREEMPT_RT semantics imprecisely.
 
 The module is kernel agnostic with respect to scheduling model. It observes scheduler and interrupt tracepoints that are present across Linux configurations, and reports timing relationships between events (e.g. wakeup → run, run → sleep).
@@ -16,11 +42,6 @@ The module is kernel agnostic with respect to scheduling model. It observes sche
 As a result, it can be used on PREEMPT, PREEMPT_RT, and non-RT kernels to diagnose scheduling behavior. Kernel configuration affects absolute latency values and tail behavior, but does not change the semantics of the metrics being collected. Full evaluation on PREEMPT_RT is left as future work. 
 
 Additionally, the IRQ handler response time metric is defined to align with PREEMPT_RT semantics, where IRQ handlers execute in threaded context.
-
-### Quick Notes
-- `jerry_rt_module/irq_button_demo` is the kernel module made to configure an GPIO on the PI as an IRQ line, and its according handlers.
-- `jerry_rt_module/jerry` is the kernel patch needed for the IRQ tracing. <b>TODO: Without kernel patch, the module won't load. I need to make this an optional feature.</b>
-- Other files are either with the main kernel module or workload folders used to test, featured in `writeup.pdf`.
 
 ## Motivation
 
