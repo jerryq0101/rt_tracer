@@ -2,7 +2,7 @@
 
 This repository contains a low overhead Linux kernel module and userspace tooling for identifying **worst case scheduler latency, response time, and IRQ handling delays** on PREEMPT / PREEMPT_RT systems.
 
-The module was built to **validate real time scheduling assumptions under interference**. Specifically, to quickly determine whether observed workloads meet expected latency bounds, and to isolate sources of timing violation such as priority inversion, IRQ contention, or scheduler misconfiguration. Rather than using a full trace analysis or offline analysis, a developer may do a quick check using the module to see whether their workload is behaving correctly when a new task is added to the cumulative system.
+The module was built to **validate real time scheduling assumptions under interference**. Specifically, to quickly determine whether observed workloads meet expected latency bounds, and to isolate sources of timing violation such as priority inversion, IRQ contention, or scheduler misconfiguration. For example, rather than using a full trace analysis or offline analysis, a developer may do a quick check using the module to see whether their workload is behaving correctly when a new task is added to the cumulative system.
 
 Full writeup (design overview/tradeoffs, module evaluation of correctness, SMP concurrency): `writeup.pdf`
 
