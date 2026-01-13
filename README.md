@@ -1,291 +1,272 @@
-# Project - RT
+# jerry_rt_module
 
-The vision of this tool is to allow people to run this on an existing Linux system that cares about real time execution, and see <b>quickly</b> if the system is in a healthy real time state.
+This is a low overhead kernel module for quickly identifying worst case scheduler latency, response time, and IRQ handling delays on PREEMPT / PREEMPT_RT Linux.
 
-A healthy real time state means that the intended important tasks are being addressed (low latency) and also finished (responded to) on time.
+This is specifically designed for and evaluted on Raspberry Pi 4 (SMP) running Buildroot's PREEMPT Linux.
+- Buildroot 2025.11-git
+- Any Raspberry Pi 4 compatible Linux kernel with the PREEMPT or PREEMPT_RT model.
+    - My OS: Linux buildroot 6.12.41-v8 #1 SMP PREEMPT Thu Nov 20 17:18:47 UTC 2025 aarch64 GNU/Linux
 
-This is (hopefully) helpful for applications that are time critical. For example rockets that need a motor turned in a particular moment. Verifying that latency is low allows one to know the task is being gotten to in a short time. Verifying that response time is low allows one to know that the task is being finished in a short time.
 
-The core point of this application is specific to verifying scheduling / RT qualities in a quicker manner than browsing the entire trace-cmd or kernelshark logs (which is a lot). Or, if there is a particular oddity, we can quickly pin point which process is the root of the issue.
 
-## The first part - Latency
+Note: Despite the name, the current evaluation was performed on a PREEMPT (low latency) kernel rather than PREEMPT_RT. As a result, some wording in repo/writeup.pdf may refer to PREEMPT_RT semantics imprecisely.
 
-To begin, I made a kernel module to track latency for a particular time period. 
+The module is kernel agnostic with respect to scheduling model. It observes scheduler and interrupt tracepoints that are present across Linux configurations, and reports timing relationships between events (e.g. wakeup → run, run → sleep).
 
-This is a draft to describe the mechanism of how the initial module works. This doesn't need to be polished right now 11/10/25.
+As a result, it can be used on PREEMPT, PREEMPT_RT, and non-RT kernels to diagnose scheduling behavior. Kernel configuration affects absolute latency values and tail behavior, but does not change the semantics of the metrics being collected. Full evaluation on PREEMPT_RT is left as future work. 
 
-To begin, I subscribe particular tracepoints to sched_wakeup and sched_running. 
+Additionally, the IRQ handler response time metric is defined to align with PREEMPT_RT semantics, where IRQ handlers execute in threaded context.
 
-sched_wakeup: is the particular point where a process switches state to ready.
+### Quick Notes
+- `jerry_rt_module/irq_button_demo` is the kernel module made to configure an GPIO on the PI as an IRQ line, and its according handlers.
+- `jerry_rt_module/jerry` is the kernel patch needed for the IRQ tracing. <b>TODO: Without kernel patch, the module won't load. I need to make this an optional feature.</b>
+- Other files are either with the main kernel module or workload folders used to test, featured in `writeup.pdf`.
 
-sched_running: is precisely the moment before a process is context switched to on a specific core.
+## Motivation
 
-The definition of latency that I am trackin here is sched_running - sched_wakeup.
-- This tracks precisely the decision making of the scheduler and interaction with other tasks. 
-- This would not track factors such as time when hardware sends the interrupt to the IRQ line
+Debugging real time scheduling issues on Linux often requires collecting large kernel traces and manually inspecting them with tools such as trace-cmd or kernelshark. This process is time consuming and makes it difficult to quickly identify which task or event is responsible in a scheduling induced case of delay.
 
-I use ftrace's tracepoints:
-- they are in pointer form, so I find it using for_each_kernel_tracepoint 
-- then register my custom handler functions to the wakeup and the sched_switch points
-- effectively, the tracepoints are a subscription of events where they would do a call back for my function.
+This project aims to provide a lightweight alternative: track worst case latency metrics per PID directly in the kernel, along with a best effort scheduler trace for the worst observed case. This aims to have minimal interference to the running workload.
 
-The functions that they would call back at are shced_wakeup_handler and sched_switched_handler.
+## Features
 
-TLDR: 
-1. Registering tracepoints at each sched_wakeup and sched_switch. 
-2. We have a pid table.
-3. If the particular pid wakes up, we record its wakeup time. 
-4. If a particular pid gets switched to, we calculate its latency using the last wakeup time.
+- Tracks per pid worst case metrics: Schedule in latency, Voluntary sleep response time (wake -> first voluntary sleep), control loop relief time (wake -> timer sleep), IRQ threaded handler execution time
+- Records best effort scheduler traces for worst case metrics (need to add with trace and have SLO for the specific metric)
+- Allows configuration of a SLO for each metric and records number of violations of SLO
 
-Expectation: a pid wakes up - record, ... scheduler does its thing ..., some scheduler decides to pick the pid and schedule it - record. This pair of data forms the min/max.
+## Design highlights
+- CAS loops used for max/min updates to avoid global locks
+- Trace collection protected by per-metric spinlocks
+- Best-effort trace semantics: correctness of numeric metrics prioritized over complete trace capture
 
+## Installation
 
-Full process: 
-1. Hardware interrupt happens
-2. CPU gets that signal
-25. Runs Top half of handler
-3. (Runs bottom half of handler) The bottom half of handler (which is a continuous loop that is waiting for the Top half to wake it up to start handling interrupts)
-4. The IRQ thread will call a device specific handler. 
-45. After handling, the the handler would mark processes in the wait queue to be ready. (AT THIS POINT, WAKEUP TRACEPOINT FIRES)
-5. The IRQ Thread would then call the scheduler.
-6. (Same core scheduler) Scheduler would make a decision to schedule a task (PREEMPT_RT: the highest priority one)
-7. Before the scheduler calls context switch to a task, sched_switched fires, and we record that tracepoint if it is our task.
+This project is designed to run on a Raspberry Pi 4 with a PREEMPT_RT enabled Linux kernel. I used PREEMPT in my evaluations, however, installation and functionality remain the same.
 
-### Recording
+### 1. Build a PREEMPT_RT kernel for Raspberry Pi 4
 
-Core stat recorded. sched_wakeup handler will continously record the latest wakeup time. sched_switched handler will record the time and subtract the latest wake up time from it, and collect one instance of latency. 
+1. Install Buildroot and select an existing Raspberry Pi 4 configuration in menuconfig
+2. Enable a PREEMPT_RT kernel variant in the Buildroot kernel configuration (linux-menuconfig).
+3. Apply the kernel patch provided in this repository:
+   - Patch location: `jerry_rt_module/jerry/`
+   - Add the patch according to Buildroot instructions (in 2025 Dec, I moved the `jerry` folder into `buildroot/board/` and ran `make`)
+4. Build the full system image using Buildroot (`make`).
 
-### Thoughts on races
+Once completed, flash the generated image onto an SD card and boot it on the Raspberry Pi 4. The system should now be running Linux with PREEMPT_RT enabled.
 
-We want to make sure that the data we are collecting is valid. 
 
-This requires ensuring that there is mutual exclusion for the pidtab array at a particular pid. In other words, A can't access pidtab[30] at the same time as B, where A and B are different threads.
+> Note: If you already have a PREEMPT_RT kernel running on a Pi 4, you
+> may skip the Buildroot steps and proceed directly to module installation.
 
-Given we are running on Pi 4 which has 4 CPU cores, an IRQ thread could run at the same time as another IRQ thread. A context switch could happen at the same time as on another core.
+### 2. Build and load the kernel module
 
-Assumption: The hardware will send one interrupt at a particular time
-==> CPU will acknowledge it and create one new IRQ handler thread
-==> The single IRQ handler thread will get scheduled on a single core
-==> Therefore there will only be one wakeup for a particular pid at a time.
+1. Build the kernel module (`.ko`) as part of the Buildroot build process.
 
-Assumption: At a particular time only one task can be switched to
-==> one core would take that task off the run queue and make it unavailable for others
-==> one sched_switched event
-==> one call to update_minmax(this task)
-==> Two sequential updates to this task's min max variable only at a single time.
+   Create a new package folder `jerry_rt_module` in `buildroot/package/` and populate with the necessary `.mk`, `Makefile`, `Config.in` files, and reference the `jerry_rt_module/Config.in`'s name from the `package/Config.in` to register it in menuconfig. (Reference Buildroot's process). My module files are all here in the repo (jerry_rt_module.mk, Makefile, rt_main.c, trace_ring_buffer.c/h, Config.in)
+   
+   Do `make` after the package is setup in buildroot. The module is compiled against the same kernel source tree used to build the kernel, ensuring ABI compatibility.
 
-Therefore, for a unique pid, latest_wakeup_ns updates will not race.
+   After the first `make`, to recompile the module, just do `make jerry_rt_module-rebuild` at `buildroot/`. Don't forget to enable the compilation of it in `menuconfig`.
 
-For a unique pid, min or max updates will not race. 
+2. Copy the resulting module .ko binary to the Pi 4 (e.g. via USB storage or SCP).
+    
+    This is in the `/buildroot/output/build/[module]-ver/` folder.
 
-For a single pid, we know that it cannot be in two transition states at once. In particular, being woken, and being switched to at the same time. Therefore, the modification of last_wakeup_ns and read of last_wakeup_ns at the same time is not possible.
+    For me, at `/buildroot/output/build/jerry_rt_module-1.0/jerry_rt_module.ko`
 
-Therefore, no concurrent modification of a single task_latency_entry can occur.
+3. Load the module on the Pi:
+    ```bash
+    insmod jerry_rt_module.ko
+    ```
 
-### Notes Sched Switched Handler
+### 3. IRQ demo module
 
-Takes the latest_wakeup value and consumes it. By setting it to 0 atomically using xchg, we prevent double consumption situations from happening.
+If you would like to test out tracking IRQ handlers and have a pushup button, you may install this module. This is installed in a similar fashion as above (`repo/irq_button_demo` is the module folder). 
 
-### Notes Sched Wakeup Handler
+Loading the module connects GPIO 17 pin on the Pi 4 to hard, soft IRQ handler functions defined in the module. (i.e. Signalling GPIO 17 triggers those functions).
 
-Just sets a last_wakeup_ns value. 
+> Note: While kernel modules can also be built against installed kernel headers
+> on the target system, this project builds the module directly within
+> Buildroot, which is the recommended approach for embedded systems.
 
-There could be multiple wakeups that come before a sched_switch event. We will set last_wakeup_ns everytime. 
+## Usage
 
-Therefore, latency = running - last_wakeup_time
+Remark that the module provides per PID real time scheduling diagnostics, including:
+- Max/min latency and response metrics
+- SLO (upper bound) violation counting
+- Worst case trace capture for debugging scheduling anomalies
 
+All interaction is done via sysfs after loading the kernel module.
 
-### On sched_wakeup and sched_switched being on different cores
+### Loading the module
+```bash
+insmod jerry_rt_module.ko
+```
+Replace `jerry_rt_module.ko` with the full path to the module binary.
 
-Say the task being woken up right now is Task A.
+After this step, the module is loaded but no PIDs are tracked yet.
 
-IRQ thread might start on Core 1. sched_wakeup for task A would come from Core 1. Scheduler will also be called on the same Core 1 in that IRQ thread.
+### Track a PID
+
+You can track a PID with or without trace capture.
+
+<b>Track without trace</b>
+```
+echo "123" > /sys/kernel/jerry_rt_module/add_pid
+```
+
+<b>Track with trace enabled</b>
+```
+echo "123" > /sys/kernel/jerry_rt_module/add_pid
+```
+
+Tracking with trace enables worst-case scheduler trace collection when SLO violations occur.
+
+### Configure SLO Bounds (Violations + Trace)
+
+After tracking a PID, you can configure upper bounds (SLOs) for specific metrics. Violations are counted whenever the metric exceeds the configured bound. 
 
-Say Core 1 scheduler doesn't take task A from run queue.
+<b>Example: Latency bound (nanoseconds)</b>
+```bash
+echo "123 5000" > /sys/kernel/jerry_rt_module/set_slo_latency_bound
+```
+Format:
+```bash
+echo "[pid] [bound_in_ns]" > /sys/kernel/jerry_rt_module/set_slo_XXXXX_bound
+```
 
-In another core 3 in a later time, the scheduler could be called and if task A is the highest priority out of run queue, then it can context switch to task A. So there could be a pair of sched_wakeup and sched_switch handlers that are run on different cores.
+<b>Other supported SLOs</b>
+- `set_slo_response_bound`
+- `set_slo_response_relief_bound`
+- `set_slo_irq_handling_bound`
+
+<i>Note: If tracing was enabled when adding the PID, the trace desired metric's corresponding SLO must be set for a violation trace to be collected. </i>
 
-### On Coherence and Consistency
+### Stop Tracking
 
-About cache coherence and consistency. The question of when a core calling sched_switch handler, will it see the updated last_wakeup_ns?
+<b>Remove a single PID</b>
+```bash
+echo "123" > /sys/kernel/jerry_rt_module/del_pid
+```
+This:
+- Stops tracking the PID
+- Prints all accumulated statistics and traces to the kernel log (can view using dmesg)
 
-The most that we can do as programmers is to ensure that there aren't any thread level races for a single pid. We can't verify that if wake on core 1 happens before switch on core 2, that we will for sure see that on core 2, that is the hardware's job to sync. 
+<br></br>
+<b>Remove the module (stop all tracking)</b>
+```bash
+rmmod jerry_rt_module.ko
+```
+This:
+- Stops tracking all PIDs
+- Prints statistics for all tracked PIDs
+- Unloads the module
 
-smp_wmb() in start_recording_pid(pid) does a semi-consistency guarantee. It ensures that before the WRITE to active=true, the other CPUs have seen all the previous setup happen while active = false. Therefore if we see active=true, and then pid's struct must have been setup already. Therefore we won't ever be writing to a unsetup pid struct.
 
-Potentialy smp consistency enforcement applies to other cases I didn't consider yet...
+<br/>
 
-READ_ONCE/WRITE_ONCE is making sure that the compiler doesn't do any funny reordering (e.g. partial word writes or reads). 
+---
 
-Remark that the CPU will do reordering of instructions, but it will ensure that dependencies and hazards get resolved.
+<br/>
+<b>Automatic cleanup on process exit</b>
+If a tracked process exits normally, the module automatically emits its final statistics using the `sched_process_exit` tracepoint.
 
-### Current UX model 
+<br/>
 
-We add and delete pids that are being tracked.
+---
 
-We use sysfs to allow for the kernel module to receive inputs using a file. Echoing to one of the files in the directory allows us to call a function to add a pid to tracked.
+### Complete Example
+```bash
+# Start tracking PID 22543 with tracing
+echo "22543 trace" > /sys/kernel/jerry_rt_module/add_pid
 
-## The second part - response time
+# Set SLO bounds (ns)
+echo "22543 2" > /sys/kernel/jerry_rt_module/set_slo_latency_bound
+echo "22543 2" > /sys/kernel/jerry_rt_module/set_slo_response_bound
+echo "22543 2" > /sys/kernel/jerry_rt_module/set_slo_response_relief_bound
 
-There are some changes to previous expectations.
+# Let workload run...
 
-### Updated World View
+# Stop tracking and emit statistics
+echo "22543" > /sys/kernel/jerry_rt_module/del_pid
+```
 
-It turns out the control loop did not behave as expected in industry: "A good control loop would (barely) block."
 
-However, this doesn't make any difference to us because we both track wake -> rest voluntary sleep, wake -> first voluntary sleep. So following those industry assumptions, we would have first voluntary sleep = rest voluntary sleep. 
-- It is still helpful because there could be bad programming and this is not the case
-- It is still helpful because there could be other background tasks that are also structured like this.
+---
+### Example Output
 
-Control loops would not directly read from devices. A good control loop would depend on IRQs to ingest data. IRQs would be at a higher priority priority than the control loop. 
+```bash
+jerry_rt_module: PID=22543, Name=background_bloc, minLat=3519, maxLat=25482,
+minResponseTimeVoluntarySleepAllTypes=1017797, maxResponseTimeVoluntarySleepAllTypes=1059093, 
+minResponseTimeVoluntarySleepReliefBased=9223372036854775807, maxResponseTimeVoluntarySleepReliefBased=0
+  LatencyBound=2, Violations=19434
+MAX TRACE LEN: 3
+WORST LATENCY TRACE: 
+[     0 us] Event: sched_wakeup, pid: 22543, wake_cpu: 1
+[     3 us] Event: sched_switch, preemption: 0, voluntary: 1, prev_pid: 22544 (priority: 49), next_pid: 0 (priority: 120), on_cpu: 2, 
+[233048.368766] [    25 us] Event: sched_switch, preemption: 0, voluntary: 0, prev_pid: 0 (priority: 120), next_pid: 22543 (priority: 69), on_cpu: 1, 
+  ResponseBound=2, Violations=18267
+MAX TRACE LEN: 3
+WORST RESPONSE TIME TRACE: 
+[     0 us] Event: sched_wakeup, pid: 22543, wake_cpu: 1
+[ =    7 us] Event: sched_switch, preemption: 0, voluntary: 0, prev_pid: 0 (priority: 120), next_pid: 22543 (priority: 69), on_cpu: 1, 
+[  1059 us] Event: sched_switch, preemption: 0, voluntary: 1, prev_pid: 22543 (priority: 69), next_pid: 0 (priority: 120), on_cpu: 1, 
+  ResponseReliefBound=2, Violations=0
+MAX TRACE LEN: 0
+WORST RESPONSE RELIEF TIME TRACE: 
+```
 
-Hardware interrupt -> higher priority IRQ thread services the hardware -> IRQ thread places data in some shared buffer and finishes -> control loop (lower priority) would read from the buffer.
+Traces help identify why a worst-case occurred (CPU, preemption, competing tasks, etc.).
 
-Conclusions from this:
-1. IRQ threads should be tracked because they are handling data (I go into what they should be tracked for below response time tracking)
-2. (The control loop would barely block one mentioned above)
+---
 
-### The Response time model 
+### Control Plane Precision
 
-Response time = time for "relief" sleep - time woken up
+The module intentionally does not strictly synchronize userspace control commands with in flight tracepoint execution.
 
-Response time = time for first voluntary sleep - time woken up 
+This means the following boundaries are not precisely defined:
+- When tracking exactly begins after add_pid
+- When SLO bounds exactly take effect
+- When tracking exactly stops after del_pid
 
-Initially when designing response time metric, I didn't account for the fact that a task may sleep. In order to account for this, I decided to split them into two metrics, a "relief" sleep metric, and a metric from wake until the first sleep.
+Why this happens
+- Tracepoint handlers execute asynchronously on other CPUs
+- Control plane updates (echo commands) are not synchronized against them
+- Writes become visible eventually, but not at a deterministic instant
 
-A control loop is assumed to have a relief sleep at the end. This is because if a control loop doesn't have a relief sleep it would be looping in an undefined frequency determined randomly by the hardware itself. Put a relief sleep (even if super short) to have a definition of frequency for the control loop.
+Practical impact
+- An initial latency cycle may be missed after add_pid
+- A small number of events may still be counted after del_pid
+- SLO checks may briefly use the old or new bound
 
-Despite the updated world model, I believe that tracking both is still useful. As mentioned above: it's good when control loop actually blocks, and it's good for other user level tasks that do potentially block.
+This behavior is intentional.
 
-### Implementation of response_time = time at first voluntary sleep - time woken up
+The design prioritizes minimal runtime interference over precise control plane boundaries. A future version may tighten this window (e.g., using xchg on PID addition), at the cost of slightly higher overhead.
 
-`static void sched_switched_handler(void *data, bool preempt, struct task_struct *prev, struct task_struct *next, unsigned int prev_state)`
 
-From sched_switch TP_PROTO, the tracepoint that fires gives information on the previous task (prev) that is switching out and the new task (next) that is switching in. The prev and next structs provide information about each of these tasks.
+## Conclusion and Further reading
 
-prev_state indicates the state that the prev task that is currently in at this tracepoint.
+This module is intended as a practical, low-overhead tool for quickly assessing real time scheduling behavior on PREEMPT_RT Linux systems. Rather than replacing full tracing frameworks, it complements them by providing immediate visibility into worst case behavior with minimal disruption to the running workload.
 
-`                bool voluntary = prev_state & (TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE | TASK_PARKED | TASK_IDLE | TASK_DEAD);`
+For readers interested in deeper details, including:
+- design rationale and tradeoffs
+- concurrency and synchronization guarantees
+- trace correctness semantics
+- overhead evaluation and RT impact analysis
+- space/memory considerations
 
-At a sched_switch out of prev, we check if prev is entering one of these states. Each one of these states indicates that prev is either going to sleep or exiting (entailing that it has finished its "current action"). If it is one of such switch reasons, we subtract the current time (voluntary sleep) by the wakeup to calculate the response time. This allows us to calculate max/min.
-- curr_wu_ns is the a holding variable for the wakeup time (it is only set if we are switched into, and cleared on every voluntary sleep to not have multiple voluntary sleep using the same wakeup)
+A full technical writeup is available: `repo/writeup.pdf`
 
-Why must this switch capture a state change that causes a voluntary sleep?
+That document expands on the internal mechanisms, explains known limitations, and motivates the design choices made to balance observability with real-time safety.
 
-Say a switch was happening because the task was killed, by the time the scheduler had determined that this task needs to be moved off of the CPU, an according state change happened for this task in order to cause such an action.
+`case_studies` and `sanity_check_workloads` are workloads used for the full writeup.
 
-The flow is like: 
-1. A task's state change happens because of some action happened (it is calling something blocking)
-2. schedule() is called to reflect such a change
-3. scheduler realizes this task's state is not running anymore, and starts running some other process.
+## Future Work
 
-Therefore a state for a particular prev has to have been updated to cause a particular sched_switch.
+- Evaluations on a PREEMPT_RT kernel
+- Potential races that I haven't caught probably exist
+- To allow the use of tgids rather than pids, as there isn’t support for threads spawned under a pid yet.
+- To allow for easier IRQ tracing setup without doing a kernel patch.
+- Finding a way to use less memory when running the module for more strict embedded environments.
 
-If it is a state change that causes a preemption, we do not capture it. Preemption would leave the task still in prev_state=RUNNING. Unlike the flow depicted above, the state of the program doesn't change and the state doesn't direct the scheduler to make a change. The scheduler simply decides to move the program from the CPU to the run queue 
-
-
-### Implementation of response_time = time at relief sleep - time woken up.
-
-This implementation relies on a similar model with the above. A relief sleep is a particular type of voluntary sleep.
-
-However, for this one, we do want to use an FSM to reason about it.
-
-We define a task entering relief sleep as the task calling nanosleep() or clock_nanosleep().
-
-If we want to distinguish this from other voluntary sleep reasons, we trace sleep syscalls.
-
-The flow then goes like this:
-1. Program runs
-2. Program calls sleep
-3. sleep changes program state
-4. scheduler removes program from the CPU
-
-Core: a program has to have first called sleep() (to change its state), then reach our sched_switch tracepoint.
-
-Therefore, if we track whether this voluntary has a sleep right before it, we are able to distinguish if this voluntary sleep is a relief sleep or not.
-
-Say if there are other types of (voluntary) sleep that cause the task to sleep before our sleep. We distinguish these by both by using three variables `cycle_active`, `scause`, and `last_sleep_cause`.
-
-`scause` allows us to detect a relief sleep within our response time cycle. After a sleep happens, we will set `scause=SC_TIMER`. Then, upon the immediate next sched_switch, when our task switches out of the CPU, we'd know that our task had been switched out because it is sleeping.
-
-`last_sleep_cause` allows us to track a relief based sleep to wake up correctly. Upon doing a relief sleep, we set `last_sleep_cause=SC_TIMER`. At the post wakeup, we'd know by checking `last_sleep_cause` that the previous sleep was a relief sleep, therefore we can start tracking a new cycle and set `cycle_active=true`. 
-
-`cycle_active` helps when we have detected a timer based sleep, and want to check whether we have captured the wakeup that is paired with this timer based sleep. Otherwise, we could account for an invalid datapoint in our min and max.
-
-![Mini FSM](./resources/mini_FSM.png)
-
-To implement this FSM, we introduce several new variables in the task latency struct.
-
-scause - accounts when a sleep call happens (used when sched_switch happens)
-
-last_sleep_cause - say if program did a voluntary sleep, sched_switch'ed out, and there was a wakeup, we need to know whether the previous sleep was part of our cycle or not.
-
-cycle_start_ns - this is the variable we consume at q_2, and we set at q_0 (when we do detect a voluntary based sleep we consume this).
-
-cycle_active - if our program is between a wakeup and a relief sleep.
-
-resp_cycle_max/min_ns - tracks the max / min values in response time from wakeup to relief.
-
-
-### Thoughts on applicability
-
-Response time is being tracked for user programs, the control loop and IRQ threads.
-
-For the control loop (a good design), response time will be similar to relief response time.
-
-For a background user program, there could be multiple cases.
-
-1 - User program is a periodically run loop that accesses hardware 
-
-2 - User program is an event activated function that blocks 
-
-3 - User program is an event activated function that doesn't block 
-
-Remark that you need a loop even with a non-periodic task that is waiting on hardware interrupts. Since after the first interrupt comes, it handles it, you just finish execution and that task is gone.
-
-For 1, there are hardware accesses, there is a relief sleep at end of each iteration Both response times are the same in Grant's model. However in blocking cases, relief sleep version captures that.
-
-For 2, only the first voluntary sleep version captures something (a little bit) useful. We can't capture the relief sleep because there is no nanosleep, it would voluntary sleep to wait for the next interrupt. so the true time would be sleep because blocking on loop initial interrupt - woken up from interrupt. TODO: figure out how to track this potentially.
-
-For 3, only the first voluntary sleep version of response time would be useful. This captures the whole cycle.
-
-## The third part - interrupts
-
-Interrupts are an important part of RT. 
-
-According to Grantt, there is a main control loop would congest hardware information, but rarely block, because hardware information is brought to the control loop using IRQ handlers, and the main loop would just access shared memory to get information. Good design control loops pretty much don't block.
-
-IRQ handlers would be set at a higher priority. So, the moment the IRQ line is pulled, they are handled ASAP, allowing for data to be put into shared memory. When the control loop is run, it wouldn't have to wait for data by design.
-
-Aside from hardware data collection and the main loop, there will be other background userspace tasks. 
-
-For example, there are driver threads, which watch fro the commands that the control loop would send over and act on them. There can be a telemetry thread which sends data to the ground station, and writes all this data to the SD card.
-
-Therefore, we would like to make sure that: 
-IRQ handlers, userspace tasks and the control loop, are all gotten to by Linux on time and there are no outrageous delays that exist in our system.
-
-Since we are in the IRQ section lets talk about that.
-
-We register a IRQ line to a particular action that should be performed (an irqaction). 
-
-This allows Linux to create a dedicated thread, which effectively just contains a infinite loop with our IRQ handler in it and sleeps when there is no line pulls that need to be handled.
-
-Then, when the IRQ line is pulled by the hardware, the top half is first ran in hardirq context. Only after, the our irq handling thread is woken up and our according handler would run. After our handler runs, if there are no more interrupts, that thread sleeps again.
-
-Therefore, to get a gauge of how fast we start to address an irq, we can track latency of running the irq thread.
-
-To get a gauge of how fast we handle individual interrupts though, we can use a voluntary sleep response time. Since the thread would effectively wake upon having an interrupt to handle and sleep when there are no more interrupts to handle, for a single interrupt, this would effectively measure the time taken to handle.
-
-However, through experimentation, I found that there could be potentially be interrupt storms (where another irq pull happens while we were handling the last irq in the loop body). This causes the irq thread to continue looping without sleeping after handing each interrupt. 
-
-Therefore response time doesn't capture this case where multiple interrupts happen.
-
-Case 2 - Additionally, potentially the IRQ handler function blocks. Therefore the first sleep may not capture the full duration of a single handle given an absence of an interrupt storm.
-
-Due to these two cases, I made a kernel patch to add in tracepoints to the irq handling thread. Each iteration is a single handle, therefore, these tracepoints just track the loop body.
-
-This allows me to hook into gauge how long an individual irq pull for this particular irqaction is handled. I tabulate the min max for this.
-
-
-
-The concern, there could be an other case, where we have an irq storm, and multiple (a lot of the same) interrupts arrive at t0. Then the irq handler starts handling them. Since IRQ handling goes sequentially, potentially each one takes a little bit to handle, and eventually it gets to the last one, and it gets handled. Despite each interrupt being handled in a short time, it is the latency for the last interrupt that we are concerned about since it waited a long time (we don't measure this since the thread didn't sleep).
+Contributions, feedback, and discussion are welcome (jerryq[zero one zero one with no spaces]@[jee mail like the popular one].com)
