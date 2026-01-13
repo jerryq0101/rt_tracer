@@ -4,7 +4,7 @@ This repository contains a low overhead Linux kernel module and userspace toolin
 
 The module was built to **validate real time scheduling assumptions under interference**. Specifically, to quickly determine whether observed workloads meet expected latency bounds, and to isolate sources of timing violation such as priority inversion, IRQ contention, or scheduler misconfiguration. For example, rather than using a full trace analysis (trace-cmd) or offline analysis, a developer may do a quick check using the module to see whether their workload is behaving correctly when a new task is added to the cumulative system.
 
-Full writeup (design overview/tradeoffs, module evaluation of correctness, SMP concurrency): `writeup.pdf`
+**Full writeup (design overview/tradeoffs, module evaluation of correctness, SMP concurrency): `writeup.pdf`**
 
 This is specifically designed for PREEMPT_RT, and evaluted on Raspberry Pi 4 (SMP) running Buildroot's PREEMPT Linux.
 - Buildroot 2025.11-git
