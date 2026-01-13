@@ -251,28 +251,28 @@ Traces help identify why a worst-case occurred (CPU, preemption, competing tasks
 The module intentionally does not strictly synchronize userspace control commands with in flight tracepoint execution.
 
 This means the following boundaries are not precisely defined:
-- When tracking exactly begins after add_pid
+- When tracking exactly begins after `add_pid`
 - When SLO bounds exactly take effect
-- When tracking exactly stops after del_pid
+- When tracking exactly stops after `del_pid`
 
-Why this happens
+Why this happens:
 - Tracepoint handlers execute asynchronously on other CPUs
 - Control plane updates (echo commands) are not synchronized against them
 - Writes become visible eventually, but not at a deterministic instant
 
-Practical impact
-- An initial latency cycle may be missed after add_pid
-- A small number of events may still be counted after del_pid
+Practical impact:
+- An initial latency cycle may be missed after `add_pid`
+- A small number of events may still be counted after `del_pid`
 - SLO checks may briefly use the old or new bound
 
 This behavior is intentional.
 
-The design prioritizes minimal runtime interference over precise control plane boundaries. A future version may tighten this window (e.g., using xchg on PID addition), at the cost of slightly higher overhead.
+The design prioritizes minimal runtime interference over precise control plane boundaries. A future version may tighten this window (e.g. using xchg on PID addition), at the cost of slightly higher overhead.
 
 
 ## Conclusion and Further reading
 
-This module is intended as a practical, low-overhead tool for quickly assessing real time scheduling behavior on PREEMPT_RT Linux systems. Rather than replacing full tracing frameworks, it complements them by providing immediate visibility into worst case behavior with minimal disruption to the running workload.
+This module is intended as a practical, low overhead tool for quickly assessing real time scheduling behavior on PREEMPT_RT Linux systems. Rather than replacing full tracing frameworks, it complements them by providing immediate visibility into worst case behavior with minimal disruption to the running workload.
 
 For readers interested in deeper details, including:
 - design rationale and tradeoffs
@@ -283,7 +283,7 @@ For readers interested in deeper details, including:
 
 A full technical writeup is available: `rt_tracer/writeup.pdf`
 
-That document expands on the internal mechanisms, explains known limitations, and motivates the design choices made to balance observability with real-time safety.
+That document expands on the internal mechanisms, explains known limitations, and motivates the design choices made to balance observability with real time safety.
 
 `case_studies` and `sanity_check_workloads` are workloads used for the full writeup.
 
