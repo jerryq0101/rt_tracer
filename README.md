@@ -1,8 +1,12 @@
 # jerry_rt_module
 
-This is a low overhead kernel module for quickly identifying worst case scheduler latency, response time, and IRQ handling delays on PREEMPT / PREEMPT_RT Linux. This allows one to see if a workload's scheduling behaviour is as expected.
+This repository contains a low overhead Linux kernel module and userspace tooling for identifying **worst case scheduler latency, response time, and IRQ handling delays** on PREEMPT / PREEMPT_RT systems.
 
-This is specifically designed for and evaluted on Raspberry Pi 4 (SMP) running Buildroot's PREEMPT Linux.
+The module was built to **validate real time scheduling assumptions under interference**. Specifically, to determine whether observed workloads meet expected latency bounds, and to isolate sources of timing violation such as priority inversion, IRQ contention, or scheduler misconfiguration.
+
+Full writeup (design, evaluation, failure cases): `writeup.pdf`
+
+This is specifically designed for PREEMPT_RT, and evaluted on Raspberry Pi 4 (SMP) running Buildroot's PREEMPT Linux.
 - Buildroot 2025.11-git
 - Any Raspberry Pi 4 compatible Linux kernel with the PREEMPT or PREEMPT_RT model.
     - My OS: Linux buildroot 6.12.41-v8 #1 SMP PREEMPT Thu Nov 20 17:18:47 UTC 2025 aarch64 GNU/Linux
