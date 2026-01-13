@@ -30,13 +30,13 @@ This is specifically designed for and evaluted on Raspberry Pi 4 (SMP) running B
 - [Future Work](#future-work)
 
 ### Notes
-- `jerry_rt_module/irq_button_demo` is the kernel module made to configure an GPIO on the PI as an IRQ line, and its according handlers.
-- `jerry_rt_module/jerry` is the kernel patch needed for the IRQ tracing. <b>TODO: Without kernel patch, the module won't load. I need to make this an optional feature.</b>
+- `rt_tracer/irq_button_demo` is the kernel module made to configure an GPIO on the PI as an IRQ line, and its according handlers.
+- `rt_tracer/jerry` is the kernel patch needed for the IRQ tracing. <b>TODO: Without kernel patch, the module won't load. I need to make this an optional feature.</b>
 - Other files are either with the main kernel module or workload folders used to analyze and validate, featured in `writeup.pdf`.
 - Cross compiled binaries by `aarch64-linux-gnu-gcc` are included in workload folders.
 
 ### Disclaimers 
-Note: Despite the name, the current evaluation was performed on a PREEMPT (low latency) kernel rather than PREEMPT_RT. As a result, some wording in repo/writeup.pdf may refer to PREEMPT_RT semantics imprecisely.
+Note: Despite the name, the current evaluation was performed on a PREEMPT (low latency) kernel rather than PREEMPT_RT. As a result, some wording in rt_tracer/writeup.pdf may refer to PREEMPT_RT semantics imprecisely.
 
 The module is kernel agnostic with respect to scheduling model. It observes scheduler and interrupt tracepoints that are present across Linux configurations, and reports timing relationships between events (e.g. wakeup → run, run → sleep).
 
@@ -70,7 +70,7 @@ This project is designed to run on a Raspberry Pi 4 with a PREEMPT_RT enabled Li
 1. Install Buildroot and select an existing Raspberry Pi 4 configuration in menuconfig
 2. Enable a PREEMPT_RT kernel variant in the Buildroot kernel configuration (linux-menuconfig).
 3. Apply the kernel patch provided in this repository:
-   - Patch location: `jerry_rt_module/jerry/`
+   - Patch location: `rt_tracer/jerry/`
    - Add the patch according to Buildroot instructions (in 2025 Dec, I moved the `jerry` folder into `buildroot/board/` and ran `make`)
 4. Build the full system image using Buildroot (`make`).
 
@@ -84,7 +84,7 @@ Once completed, flash the generated image onto an SD card and boot it on the Ras
 
 1. Build the kernel module (`.ko`) as part of the Buildroot build process.
 
-   Create a new package folder `jerry_rt_module` in `buildroot/package/` and populate with the necessary `.mk`, `Makefile`, `Config.in` files, and reference the `jerry_rt_module/Config.in`'s name from the `package/Config.in` to register it in menuconfig. (Reference Buildroot's process). My module files are all here in the repo (jerry_rt_module.mk, Makefile, rt_main.c, trace_ring_buffer.c/h, Config.in)
+   Create a new package folder `jerry_rt_module` in `buildroot/package/` and populate with the necessary `.mk`, `Makefile`, `Config.in` files, and reference the `rt_tracer/Config.in`'s name from the `package/Config.in` to register it in menuconfig. (Reference Buildroot's process). My module files are all here in the repo (jerry_rt_module.mk, Makefile, rt_main.c, trace_ring_buffer.c/h, Config.in)
    
    Do `make` after the package is setup in buildroot. The module is compiled against the same kernel source tree used to build the kernel, ensuring ABI compatibility.
 
@@ -103,7 +103,7 @@ Once completed, flash the generated image onto an SD card and boot it on the Ras
 
 ### 3. IRQ demo module
 
-If you would like to test out tracking IRQ handlers and have a pushup button, you may install this module. This is installed in a similar fashion as above (`repo/irq_button_demo` is the module folder). 
+If you would like to test out tracking IRQ handlers and have a pushup button, you may install this module. This is installed in a similar fashion as above (`rt_tracer/irq_button_demo` is the module folder). 
 
 Loading the module connects GPIO 17 pin on the Pi 4 to hard, soft IRQ handler functions defined in the module. (i.e. Signalling GPIO 17 triggers those functions).
 
@@ -277,7 +277,7 @@ For readers interested in deeper details, including:
 - overhead evaluation and RT impact analysis
 - space/memory considerations
 
-A full technical writeup is available: `repo/writeup.pdf`
+A full technical writeup is available: `rt_tracer/writeup.pdf`
 
 That document expands on the internal mechanisms, explains known limitations, and motivates the design choices made to balance observability with real-time safety.
 
