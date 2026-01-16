@@ -73,7 +73,7 @@ This project is designed to run on a Raspberry Pi 4 with a PREEMPT_RT enabled Li
 
 1. Install Buildroot and select an existing Raspberry Pi 4 configuration in menuconfig
 2. Enable a PREEMPT_RT kernel variant in the Buildroot kernel configuration (linux-menuconfig).
-3. Enable Tracepoints inside of the kernel variant, meaning `TRACEPOINTS=y` inside linux-menuconfig (make linux-menuconfig and type / in the menu to find `TRACEPOINTS`' dependencies)
+3. Enable tracepoints inside of the kernel variant, meaning `TRACEPOINTS=y` inside linux-menuconfig (make linux-menuconfig and type / in the menu and search to find `TRACEPOINTS`' dependencies)
 3. Apply the kernel patch provided in this repository:
    - Patch location: `rt_tracer/jerry/`
    - Add the patch according to Buildroot instructions (in 2025 Dec, I moved the `jerry` folder into `buildroot/board/` and ran `make`)
